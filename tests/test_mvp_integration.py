@@ -137,3 +137,26 @@ def test_creative_permission_guard_and_citation_verification(monkeypatch):
     assert "What would you like to explore next?" not in body["assistant_message"]["content"]
     # Guard 5 ensured zero fictional canon proposals were created from a factual research question
     assert body["staged_proposals"] == []
+
+
+def test_claude_fallback_when_gemini_hits_rate_limit(monkeypatch):
+    """Verify GeminiService automatically falls back to Claude when Gemini raises a 429 rate limit."""
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "reload", lambda: None)
+    monkeypatch.setattr(settings, "gemini_api_key", "fake-gemini-key")
+    monkeypatch.setattr(settings, "claude_api_key", "fake-claude-key")
+
+    def broken_gemini_client():
+        raise Exception("429 RESOURCE_EXHAUSTED: Gemini quota rate limit reached")
+
+    monkeypatch.setattr(gemini_service, "_get_client", broken_gemini_client)
+    monkeypatch.setattr(
+        gemini_service,
+        "_call_claude_sync",
+        lambda contents, system_instruction=None, **kw: "Response seamlessly served by Claude fallback.",
+    )
+
+    out = gemini_service.generate_text("How do rain shadows work?")
+    assert out == "Response seamlessly served by Claude fallback."
+

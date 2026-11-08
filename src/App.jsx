@@ -512,11 +512,13 @@ export default function App() {
           <div>
             <span
               className={`status-dot ${
-                systemStatus?.has_valid_gemini_key ? "status-ok" : "status-warn"
+                systemStatus?.has_valid_claude_key ? "status-ok" : "status-warn"
               }`}
             />
-            Gemini API:{" "}
-            {systemStatus?.has_valid_gemini_key ? "Ready (.env)" : "Add Key in .env"}
+            Claude API:{" "}
+            {systemStatus?.has_valid_claude_key
+              ? `Ready (${systemStatus.claude_model || "claude-sonnet-5-5"})`
+              : "Add Key in .env"}
           </div>
           <div style={{ marginTop: "4px" }}>
             <span

@@ -91,8 +91,10 @@ def get_system_status(db: Session = Depends(get_db)) -> Dict[str, Any]:
     )
     return {
         "has_valid_gemini_key": settings.has_valid_gemini_key,
+        "has_valid_claude_key": settings.has_valid_claude_key,
         "has_valid_tavily_key": settings.has_valid_tavily_key,
         "gemini_model": settings.gemini_model,
+        "claude_model": settings.claude_model,
         "gemini_embedding_model": settings.gemini_embedding_model,
         "reference_documents": [
             {
@@ -798,12 +800,13 @@ def stream_message(
     if not world:
         raise HTTPException(status_code=404, detail="World not found.")
 
-    if not settings.has_valid_gemini_key:
+    settings.reload()
+    if not settings.has_any_valid_llm_key:
         raise HTTPException(
             status_code=401,
             detail={
                 "error_code": "MISSING_API_KEY",
-                "message": "GEMINI_API_KEY is missing in .env. Please paste your Gemini API key into .env.",
+                "message": "Neither GEMINI_API_KEY nor CLAUDE_API_KEY is configured in .env. Please paste your API key into .env.",
             },
         )
 

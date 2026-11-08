@@ -10,7 +10,7 @@ console.log("Starting Worldbuilding Agent Backend (FastAPI on :8000) & Frontend 
 
 const backend = spawn(
   backendCmd,
-  ["backend.main:app", "--host", "127.0.0.1", "--port", "8000"],
+  ["backend.main:app", "--host", "127.0.0.1", "--port", "8000", "--reload"],
   { stdio: "inherit", cwd: rootDir }
 );
 
