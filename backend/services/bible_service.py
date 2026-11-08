@@ -381,6 +381,120 @@ class BibleService:
         db.refresh(section)
         return section
 
+    def apply_agent_section_edit(
+        self,
+        db: Session,
+        world_id: str,
+        section_slug: str,
+        section_title: str,
+        updated_markdown: str,
+        summary_of_changes: str = "Updated by Agent from Author Brain Dump / Instructions",
+        provenance: str = "AUTHOR_CREATED",
+    ) -> Optional[BibleSection]:
+        """Apply a structured World Bible section update, fitting into default categories first."""
+        clean_slug = slugify(section_slug or section_title)
+        combined_label = f"{clean_slug} {section_title.lower()}"
+
+        # Never create or populate non-worldbuilding sections (plot outlines, character sheets, themes)
+        if any(
+            non_wb in combined_label
+            for non_wb in ("plot-structure", "characters-plot", "character-arc", "story-outline", "act-1", "themes")
+        ):
+            return None
+
+        # Map common topical headings onto the 15 default World Bible categories first
+        default_category_Rules = [
+            (("climate", "smog", "ecology", "environment", "weather", "atmosphere", "setting", "premise"), "climate-ecology"),
+            (("language", "slang", "linguistics", "terminology", "dialect", "naming", "vocab"), "languages-linguistics"),
+            (("tech", "network", "collaboration", "darknet", "software", "server", "backdoor", "engineering", "platform", "information", "identifier", "digital", "online"), "technology-engineering"),
+            (("politic", "governance", "organization", "faction", "territory", "government", "law"), "politics-governance"),
+            (("culture", "societ", "daily-life", "social", "custom", "community"), "cultures-societies"),
+            (("histor", "chronolog", "timeline", "origin", "founding"), "history-chronology"),
+            (("econom", "trade", "currency", "commerce", "market", "finance"), "economics-trade"),
+            (("geograph", "geolog", "terrain", "location", "map", "city", "region"), "geography-geology"),
+            (("war", "militar", "weapon", "security", "conflict", "defense"), "warfare-military"),
+            (("architect", "material", "building", "habitat", "infrastructure", "dress"), "architecture-material-culture"),
+            (("religio", "myth", "ritual", "faith", "deity", "church"), "religion-mythology"),
+            (("biolog", "evolution", "flora", "fauna", "species", "health"), "biology-evolution"),
+            (("cosmolog", "physics", "magic", "fundamental"), "cosmology-physics"),
+            (("philosoph", "ideolog", "ethics", "belief"), "philosophy-ideologies"),
+            (("demograph", "population", "census", "migration"), "demographics-population"),
+        ]
+
+        all_secs = self.list_sections(db, world_id)
+        sec_by_slug = {s.slug: s for s in all_secs}
+
+        section = sec_by_slug.get(clean_slug)
+        if not section:
+            for keywords, target_default_slug in default_category_Rules:
+                if any(kw in combined_label for kw in keywords) and target_default_slug in sec_by_slug:
+                    section = sec_by_slug[target_default_slug]
+                    break
+
+        if not section:
+            for s in all_secs:
+                if s.title.lower() == section_title.strip().lower() or clean_slug in s.slug or s.slug in clean_slug:
+                    section = s
+                    break
+
+        if not section:
+            max_order = (
+                db.query(BibleSection).filter(BibleSection.world_id == world_id).count()
+            )
+            section = BibleSection(
+                world_id=world_id,
+                title=section_title.strip() or "World Notes",
+                slug=clean_slug,
+                markdown_content=updated_markdown.strip(),
+                display_order=max_order,
+                dominant_provenance=(
+                    "AUTHOR_CREATED"
+                    if provenance == "AUTHOR_CREATED"
+                    else "AI_GENERATED_AUTHOR_APPROVED"
+                ),
+                version_number=1,
+            )
+            db.add(section)
+            db.flush()
+            db.add(
+                BibleSectionRevision(
+                    section_id=section.id,
+                    version_number=1,
+                    previous_markdown="",
+                    new_markdown=section.markdown_content,
+                    edit_origin="AUTHOR_APPROVED_PROPOSAL",
+                    author_note=summary_of_changes,
+                )
+            )
+        else:
+            prev_md = section.markdown_content or ""
+            new_md = updated_markdown.strip()
+            if new_md and new_md != prev_md.strip():
+                section.markdown_content = new_md
+                section.version_number += 1
+                if not prev_md.strip():
+                    section.dominant_provenance = (
+                        "AUTHOR_CREATED"
+                        if provenance == "AUTHOR_CREATED"
+                        else "AI_GENERATED_AUTHOR_APPROVED"
+                    )
+                elif section.dominant_provenance != provenance:
+                    section.dominant_provenance = "MIXED"
+                db.add(
+                    BibleSectionRevision(
+                        section_id=section.id,
+                        version_number=section.version_number,
+                        previous_markdown=prev_md,
+                        new_markdown=new_md,
+                        edit_origin="AUTHOR_APPROVED_PROPOSAL",
+                        author_note=summary_of_changes,
+                    )
+                )
+
+        db.commit()
+        db.refresh(section)
+        return section
+
     # -------------------------------------------------------------------------
     # Atomic Facts CRUD
     # -------------------------------------------------------------------------
@@ -721,6 +835,7 @@ class BibleService:
                 )
             )
             consistency_service.sync_fact_fts(db, fact_obj)
+            consistency_service.infer_and_link_dependencies(db, proposal.world_id, fact_obj)
 
         section_id = payload.target_section_id or proposal.target_section_id
         updated_section = self._append_fact_to_matching_bible_section(

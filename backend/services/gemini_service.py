@@ -133,7 +133,7 @@ class GeminiService:
         contents: Any,
         system_instruction: Optional[str] = None,
         temperature: float = 0.4,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 32000,
         model_override: Optional[str] = None,
     ) -> str:
         settings.reload()
@@ -146,41 +146,64 @@ class GeminiService:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        timeout_cfg = httpx.Timeout(connect=15.0, read=240.0, write=60.0, pool=30.0)
 
         last_status = 500
         last_body = ""
         for model_name in self._get_candidate_models(model_override):
-            payload: Dict[str, Any] = {
-                "model": model_name,
-                "max_tokens": max_output_tokens,
-                "messages": claude_messages,
-            }
-            if system_instruction:
-                payload["system"] = system_instruction
+            accumulated_text = ""
+            working_messages = list(claude_messages)
 
-            try:
-                with httpx.Client(timeout=60.0) as client:
-                    resp = client.post(ANTHROPIC_MESSAGES_URL, headers=headers, json=payload)
-            except Exception as exc:
-                raise GeminiServiceError(f"Network error calling Claude API: {exc}", 502) from exc
+            for _continuation_step in range(3):
+                payload: Dict[str, Any] = {
+                    "model": model_name,
+                    "max_tokens": max_output_tokens,
+                    "messages": working_messages,
+                }
+                if system_instruction:
+                    payload["system"] = system_instruction
 
-            if resp.status_code == 200:
-                data = resp.json()
-                blocks = data.get("content", [])
-                text_out = "".join(
-                    b.get("text", "") for b in blocks if b.get("type") == "text"
-                ).strip()
-                if text_out:
-                    if model_name != settings.claude_model:
+                try:
+                    with httpx.Client(timeout=timeout_cfg) as client:
+                        resp = client.post(ANTHROPIC_MESSAGES_URL, headers=headers, json=payload)
+                except Exception as exc:
+                    raise GeminiServiceError(f"Network error calling Claude API: {exc}", 502) from exc
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    blocks = data.get("content", [])
+                    part_text = "".join(
+                        b.get("text", "") for b in blocks if b.get("type") == "text"
+                    )
+                    accumulated_text += part_text
+                    stop_reason = data.get("stop_reason")
+
+                    if model_name != settings.claude_model and not model_override:
                         settings.update_model(model_name)
-                    return text_out
-                raise GeminiServiceError("Claude returned an empty response.", status_code=502)
 
-            last_status = resp.status_code
-            last_body = resp.text
-            if resp.status_code == 404:
-                continue
-            break
+                    if stop_reason == "max_tokens" and part_text.strip():
+                        logger.info("Claude hit max_tokens; auto-continuing response seamlessly.")
+                        working_messages = list(claude_messages) + [
+                            {"role": "assistant", "content": accumulated_text},
+                            {
+                                "role": "user",
+                                "content": "Continue from the exact word or sentence where you left off, without repeating anything.",
+                            },
+                        ]
+                        continue
+
+                    if accumulated_text.strip():
+                        return accumulated_text.strip()
+                    raise GeminiServiceError("Claude returned an empty response.", status_code=502)
+
+                last_status = resp.status_code
+                last_body = resp.text
+                if resp.status_code == 404:
+                    break
+                raise self._classify_http_error(last_status, last_body)
+
+            if accumulated_text.strip():
+                return accumulated_text.strip()
 
         raise self._classify_http_error(last_status, last_body)
 
@@ -189,7 +212,7 @@ class GeminiService:
         contents: Any,
         system_instruction: Optional[str] = None,
         temperature: float = 0.4,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 32000,
         model_override: Optional[str] = None,
     ) -> Generator[str, None, None]:
         settings.reload()
@@ -202,48 +225,79 @@ class GeminiService:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        timeout_cfg = httpx.Timeout(connect=15.0, read=240.0, write=60.0, pool=30.0)
 
         for model_name in self._get_candidate_models(model_override):
-            payload: Dict[str, Any] = {
-                "model": model_name,
-                "max_tokens": max_output_tokens,
-                "stream": True,
-                "messages": claude_messages,
-            }
-            if system_instruction:
-                payload["system"] = system_instruction
-
+            working_messages = list(claude_messages)
+            accumulated_text = ""
             yielded_any = False
-            with httpx.Client(timeout=90.0) as client:
-                with client.stream(
-                    "POST", ANTHROPIC_MESSAGES_URL, headers=headers, json=payload
-                ) as resp:
-                    if resp.status_code == 404:
-                        continue
-                    if resp.status_code != 200:
-                        err_body = resp.read().decode("utf-8", errors="replace")
-                        raise self._classify_http_error(resp.status_code, err_body)
+            model_not_found = False
 
-                    if model_name != settings.claude_model:
-                        settings.update_model(model_name)
+            for _continuation_step in range(3):
+                payload: Dict[str, Any] = {
+                    "model": model_name,
+                    "max_tokens": max_output_tokens,
+                    "stream": True,
+                    "messages": working_messages,
+                }
+                if system_instruction:
+                    payload["system"] = system_instruction
 
-                    for line in resp.iter_lines():
-                        if not line or not line.startswith("data: "):
-                            continue
-                        data_str = line[6:].strip()
-                        if data_str == "[DONE]":
+                stop_reason = None
+                step_chunks: List[str] = []
+
+                with httpx.Client(timeout=timeout_cfg) as client:
+                    with client.stream(
+                        "POST", ANTHROPIC_MESSAGES_URL, headers=headers, json=payload
+                    ) as resp:
+                        if resp.status_code == 404:
+                            model_not_found = True
                             break
-                        try:
-                            ev = json.loads(data_str)
-                        except Exception:
-                            continue
-                        if ev.get("type") == "content_block_delta":
-                            delta = ev.get("delta", {})
-                            if delta.get("type") == "text_delta" and delta.get("text"):
-                                yielded_any = True
-                                yield delta["text"]
-                    if yielded_any:
-                        return
+                        if resp.status_code != 200:
+                            err_body = resp.read().decode("utf-8", errors="replace")
+                            raise self._classify_http_error(resp.status_code, err_body)
+
+                        if model_name != settings.claude_model and not model_override:
+                            settings.update_model(model_name)
+
+                        for line in resp.iter_lines():
+                            if not line or not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                ev = json.loads(data_str)
+                            except Exception:
+                                continue
+                            ev_type = ev.get("type")
+                            if ev_type == "content_block_delta":
+                                delta = ev.get("delta", {})
+                                if delta.get("type") == "text_delta" and delta.get("text"):
+                                    txt = delta["text"]
+                                    yielded_any = True
+                                    step_chunks.append(txt)
+                                    yield txt
+                            elif ev_type == "message_delta":
+                                stop_reason = ev.get("delta", {}).get("stop_reason")
+
+                accumulated_text += "".join(step_chunks)
+                if stop_reason == "max_tokens" and step_chunks:
+                    logger.info("Claude stream hit max_tokens; auto-continuing stream seamlessly.")
+                    working_messages = list(claude_messages) + [
+                        {"role": "assistant", "content": accumulated_text},
+                        {
+                            "role": "user",
+                            "content": "Continue from the exact word or sentence where you left off, without repeating anything.",
+                        },
+                    ]
+                    continue
+                break
+
+            if model_not_found:
+                continue
+            if yielded_any:
+                return
 
         raise GeminiServiceError("No compatible Claude model succeeded for streaming.", 502)
 
@@ -255,36 +309,60 @@ class GeminiService:
         temperature: float = 0.1,
         model_override: Optional[str] = None,
     ) -> T:
-        """Execute a structured JSON generation call via Claude."""
-        schema_json = json.dumps(response_schema.model_json_schema(), indent=2)
-        claude_sys = (
-            (system_instruction or "")
-            + "\n\nCRITICAL: Respond ONLY with a single raw valid JSON object conforming to this JSON Schema. "
-            "Do NOT wrap in markdown code fences or add any explanation outside the JSON:\n"
-            + schema_json
-        ).strip()
-        raw_claude = self._call_claude_sync(
-            contents=prompt,
-            system_instruction=claude_sys,
-            temperature=temperature,
-            max_output_tokens=2048,
-            model_override=model_override,
-        )
-        cleaned_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_claude.strip())
-        # Extract first {...} block if model added surrounding text
-        start_idx = cleaned_json.find("{")
-        end_idx = cleaned_json.rfind("}")
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            cleaned_json = cleaned_json[start_idx : end_idx + 1]
-        data = json.loads(cleaned_json)
-        return response_schema.model_validate(data)
+        """Execute a structured generation call using Anthropic's native Tool Use for guaranteed valid JSON."""
+        settings.reload()
+        if not settings.has_valid_claude_key:
+            raise MissingAPIKeyError()
+
+        schema_dict = response_schema.model_json_schema()
+        tool_def = {
+            "name": "emit_structured_output",
+            "description": "Emit the structured analysis/extraction result conforming to the schema.",
+            "input_schema": schema_dict,
+        }
+        headers = {
+            "x-api-key": settings.claude_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        last_status = 500
+        last_body = ""
+        for model_name in self._get_candidate_models(model_override or "claude-haiku-5-5"):
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "max_tokens": 16384,
+                "tools": [tool_def],
+                "tool_choice": {"type": "tool", "name": "emit_structured_output"},
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if system_instruction:
+                payload["system"] = system_instruction
+
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(ANTHROPIC_MESSAGES_URL, headers=headers, json=payload)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                for block in data.get("content", []):
+                    if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
+                        return response_schema.model_validate(block["input"])
+                raise GeminiServiceError("Claude tool_use response did not contain structured input.")
+
+            last_status = resp.status_code
+            last_body = resp.text
+            if resp.status_code == 404:
+                continue
+            break
+
+        raise self._classify_http_error(last_status, last_body)
 
     def generate_text(
         self,
         contents: Any,
         system_instruction: Optional[str] = None,
         temperature: float = 0.4,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 32000,
         model_override: Optional[str] = None,
     ) -> str:
         return self._call_claude_sync(
@@ -300,7 +378,7 @@ class GeminiService:
         contents: Any,
         system_instruction: Optional[str] = None,
         temperature: float = 0.4,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 32000,
         model_override: Optional[str] = None,
     ) -> Generator[str, None, None]:
         yield from self._stream_claude(

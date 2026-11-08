@@ -41,6 +41,91 @@ class ConsistencyService:
             {"fid": fact_id},
         )
 
+    def resolve_fact_by_id_or_prefix(
+        self, db: Session, world_id: str, fact_id_or_prefix: str
+    ) -> Optional[Fact]:
+        """Resolve an existing Fact in the world by full UUID, 8-char prefix, or exact title match."""
+        cleaned = (fact_id_or_prefix or "").strip().strip("[]# ")
+        if not cleaned:
+            return None
+        exact = (
+            db.query(Fact)
+            .filter(Fact.world_id == world_id, Fact.id == cleaned)
+            .first()
+        )
+        if exact:
+            return exact
+        if len(cleaned) >= 4:
+            prefix_match = (
+                db.query(Fact)
+                .filter(Fact.world_id == world_id, Fact.id.like(f"{cleaned}%"))
+                .first()
+            )
+            if prefix_match:
+                return prefix_match
+        title_match = (
+            db.query(Fact)
+            .filter(Fact.world_id == world_id, Fact.title.ilike(f"%{cleaned}%"))
+            .first()
+        )
+        return title_match
+
+    def infer_and_link_dependencies(
+        self,
+        db: Session,
+        world_id: str,
+        new_fact: Fact,
+        explicit_dep_ids: Optional[List[str]] = None,
+    ) -> List[FactRelationship]:
+        """Wire DEPENDS_ON edges from a newly accepted fact to existing canon facts it builds upon."""
+        created_rels: List[FactRelationship] = []
+        linked_target_ids = set()
+
+        for dep_ref in explicit_dep_ids or []:
+            target = self.resolve_fact_by_id_or_prefix(db, world_id, dep_ref)
+            if target and target.id != new_fact.id and target.id not in linked_target_ids:
+                rel = self.create_relationship(
+                    db=db,
+                    world_id=world_id,
+                    source_fact_id=new_fact.id,
+                    target_fact_id=target.id,
+                    relationship_type="DEPENDS_ON",
+                    description=f"'{new_fact.title}' builds upon '{target.title}'.",
+                    created_by="AI_INFERRED",
+                )
+                created_rels.append(rel)
+                linked_target_ids.add(target.id)
+
+        # Deterministic cross-reference fallback: check if new_fact content explicitly mentions an existing canon fact's title
+        existing_canon = (
+            db.query(Fact)
+            .filter(
+                Fact.world_id == world_id,
+                Fact.canon_status == "ESTABLISHED_CANON",
+                Fact.id != new_fact.id,
+            )
+            .all()
+        )
+        new_text_lower = f"{new_fact.title} {new_fact.content}".lower()
+        for cand in existing_canon:
+            if cand.id in linked_target_ids:
+                continue
+            cand_title_clean = (cand.title or "").strip().lower()
+            if len(cand_title_clean) >= 5 and cand_title_clean in new_text_lower:
+                rel = self.create_relationship(
+                    db=db,
+                    world_id=world_id,
+                    source_fact_id=new_fact.id,
+                    target_fact_id=cand.id,
+                    relationship_type="DEPENDS_ON",
+                    description=f"Automatically inferred dependency: '{new_fact.title}' references '{cand.title}'.",
+                    created_by="AI_INFERRED",
+                )
+                created_rels.append(rel)
+                linked_target_ids.add(cand.id)
+
+        return created_rels
+
     def create_relationship(
         self,
         db: Session,
@@ -157,6 +242,36 @@ class ConsistencyService:
 
         db.commit()
         return impacted_facts
+
+    def resolve_fact_consistency_flag(
+        self, db: Session, world_id: str, fact_id: str
+    ) -> Optional[Fact]:
+        """Mark a flagged fact (NEEDS_REVIEW or CONTRADICTED) as reviewed and valid."""
+        fact = (
+            db.query(Fact)
+            .filter(Fact.id == fact_id, Fact.world_id == world_id)
+            .first()
+        )
+        if not fact:
+            return None
+        fact.consistency_status = "VALID"
+        fact.consistency_notes = ""
+        rels = (
+            db.query(FactRelationship)
+            .filter(
+                FactRelationship.world_id == world_id,
+                or_(
+                    FactRelationship.source_fact_id == fact_id,
+                    FactRelationship.target_fact_id == fact_id,
+                ),
+            )
+            .all()
+        )
+        for rel in rels:
+            rel.is_resolved = True
+        db.commit()
+        db.refresh(fact)
+        return fact
 
     def get_world_consistency_report(
         self, db: Session, world_id: str

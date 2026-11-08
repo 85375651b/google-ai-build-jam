@@ -1,5 +1,6 @@
 """FastAPI application entrypoint exposing all REST and SSE endpoints for the Worldbuilding Agent."""
 
+from contextlib import asynccontextmanager
 import json
 import logging
 from pathlib import Path
@@ -31,6 +32,7 @@ from backend.schemas import (
     BibleSectionUpdate,
     ChatMessageRequest,
     ConversationCreate,
+    ConversationUpdate,
     ExpertiseOverrideRequest,
     FactCreate,
     FactRelationshipCreate,
@@ -54,19 +56,8 @@ from backend.services.world_service import world_service
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Worldbuilding Agent API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     init_db()
     db_gen = get_db()
     db = next(db_gen)
@@ -76,6 +67,18 @@ def on_startup() -> None:
         logger.warning("Startup book check skipped: %s", exc)
     finally:
         db.close()
+    yield
+
+
+app = FastAPI(title="Worldbuilding Agent API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================================
@@ -130,6 +133,7 @@ def get_system_status(db: Session = Depends(get_db)) -> Dict[str, Any]:
 def update_model_config(payload: ModelConfigUpdateRequest) -> Dict[str, Any]:
     settings.update_model(payload.gemini_model, payload.gemini_embedding_model)
     return {
+        "claude_model": settings.claude_model,
         "gemini_model": settings.gemini_model,
         "gemini_embedding_model": settings.gemini_embedding_model,
     }
@@ -538,6 +542,20 @@ def get_consistency_report(
     return consistency_service.get_world_consistency_report(db, world_id)
 
 
+@app.post("/api/worlds/{world_id}/consistency/facts/{fact_id}/resolve")
+def resolve_consistency_flag(
+    world_id: str, fact_id: str, db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    fact = consistency_service.resolve_fact_consistency_flag(db, world_id, fact_id)
+    if not fact:
+        raise HTTPException(status_code=404, detail="Fact not found.")
+    return {
+        "id": fact.id,
+        "consistency_status": fact.consistency_status,
+        "consistency_notes": fact.consistency_notes,
+    }
+
+
 @app.get("/api/worlds/{world_id}/proposals")
 def list_canon_proposals(
     world_id: str,
@@ -581,13 +599,20 @@ def resolve_canon_proposal(
 @app.get("/api/worlds/{world_id}/bible/export")
 def export_world_bible(
     world_id: str,
-    fmt: str = Query("md", description="md | pdf | docx"),
+    fmt: str = Query("md", description="md | pdf | docx | json"),
     db: Session = Depends(get_db),
 ) -> Response:
     w = world_service.get_world(db, world_id)
     if not w:
         raise HTTPException(status_code=404, detail="World not found.")
     fmt_lower = fmt.lower()
+    if fmt_lower == "json":
+        bundle = world_service.export_project_bundle(db, w)
+        return Response(
+            content=json.dumps(bundle, indent=2),
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{w.name}_Project_Backup.json"'},
+        )
     if fmt_lower == "pdf":
         pdf_bytes = bible_service.export_world_bible_pdf(db, w)
         return Response(
@@ -610,25 +635,60 @@ def export_world_bible(
     )
 
 
+@app.get("/api/worlds/{world_id}/export-project")
+def export_world_project_bundle(
+    world_id: str, db: Session = Depends(get_db)
+) -> Response:
+    w = world_service.get_world(db, world_id)
+    if not w:
+        raise HTTPException(status_code=404, detail="World not found.")
+    bundle = world_service.export_project_bundle(db, w)
+    return Response(
+        content=json.dumps(bundle, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{w.name}_Project_Backup.json"'},
+    )
+
+
+@app.post("/api/worlds/import-project")
+def import_world_project_bundle(
+    bundle: Dict[str, Any], db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    try:
+        w = world_service.import_project_bundle(db, bundle)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "id": w.id,
+        "name": w.name,
+        "description": w.description,
+        "genre_notes": w.genre_notes,
+        "created_at": w.created_at.isoformat(),
+    }
+
+
 # ============================================================================
 # 4. Conversational Agent & Streaming Chat Endpoints
 # ============================================================================
 
 @app.get("/api/worlds/{world_id}/conversations")
 def list_conversations(
-    world_id: str, db: Session = Depends(get_db)
+    world_id: str,
+    include_archived: bool = Query(False),
+    db: Session = Depends(get_db),
 ) -> List[Dict[str, Any]]:
-    convs = (
-        db.query(Conversation)
-        .filter(Conversation.world_id == world_id, Conversation.is_archived.is_(False))
-        .order_by(Conversation.updated_at.desc())
-        .all()
-    )
+    query = db.query(Conversation).filter(Conversation.world_id == world_id)
+    if not include_archived:
+        query = query.filter(Conversation.is_archived.is_(False))
+    convs = query.order_by(Conversation.updated_at.desc()).all()
     return [
         {
             "id": c.id,
             "title": c.title,
             "focused_subject_id": c.focused_subject_id,
+            "rolling_summary": c.rolling_summary or "",
+            "is_archived": c.is_archived,
+            "created_at": c.created_at.isoformat(),
             "updated_at": c.updated_at.isoformat(),
         }
         for c in convs
@@ -647,7 +707,97 @@ def create_conversation(
     db.add(c)
     db.commit()
     db.refresh(c)
-    return {"id": c.id, "title": c.title, "updated_at": c.updated_at.isoformat()}
+    return {
+        "id": c.id,
+        "title": c.title,
+        "focused_subject_id": c.focused_subject_id,
+        "rolling_summary": c.rolling_summary or "",
+        "is_archived": c.is_archived,
+        "created_at": c.created_at.isoformat(),
+        "updated_at": c.updated_at.isoformat(),
+    }
+
+
+@app.put("/api/conversations/{conversation_id}")
+def update_conversation(
+    conversation_id: str,
+    payload: ConversationUpdate,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if payload.title is not None and payload.title.strip():
+        conv.title = payload.title.strip()
+    if payload.focused_subject_id is not None:
+        conv.focused_subject_id = payload.focused_subject_id
+    if payload.is_archived is not None:
+        conv.is_archived = payload.is_archived
+    db.commit()
+    db.refresh(conv)
+
+    # If the last active thread in the world was archived, automatically create a fresh default thread
+    replacement_conv = None
+    if conv.is_archived:
+        remaining = (
+            db.query(Conversation)
+            .filter(
+                Conversation.world_id == conv.world_id,
+                Conversation.is_archived.is_(False),
+            )
+            .count()
+        )
+        if remaining == 0:
+            replacement_conv = Conversation(
+                world_id=conv.world_id,
+                title="New Consultation",
+            )
+            db.add(replacement_conv)
+            db.commit()
+            db.refresh(replacement_conv)
+
+    return {
+        "id": conv.id,
+        "title": conv.title,
+        "focused_subject_id": conv.focused_subject_id,
+        "rolling_summary": conv.rolling_summary or "",
+        "is_archived": conv.is_archived,
+        "updated_at": conv.updated_at.isoformat(),
+        "replacement_conversation_id": replacement_conv.id if replacement_conv else None,
+    }
+
+
+@app.delete("/api/conversations/{conversation_id}")
+def archive_or_delete_conversation(
+    conversation_id: str, db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    conv.is_archived = True
+    db.commit()
+
+    remaining = (
+        db.query(Conversation)
+        .filter(
+            Conversation.world_id == conv.world_id,
+            Conversation.is_archived.is_(False),
+        )
+        .first()
+    )
+    if not remaining:
+        remaining = Conversation(
+            world_id=conv.world_id,
+            title="New Consultation",
+        )
+        db.add(remaining)
+        db.commit()
+        db.refresh(remaining)
+
+    return {
+        "status": "archived",
+        "active_conversation_id": remaining.id,
+    }
 
 
 @app.get("/api/conversations/{conversation_id}/messages")
@@ -708,6 +858,7 @@ def send_message_sync(
             book_retrieval=knowledge["book"],
             online_research=knowledge["online"],
             focused_subject_id=payload.focused_subject_id or conv.focused_subject_id,
+            conversation=conv,
         )
         contents = context_assembler.build_conversation_contents(
             db, conv, payload.content
@@ -737,6 +888,7 @@ def send_message_sync(
             "primary_intent": analysis.primary_intent,
             "secondary_intents": analysis.secondary_intents,
             "permission_level": analysis.creative_permission.level,
+            "naming_mode": analysis.creative_permission.naming_mode,
             "active_domains": analysis.active_domains,
             "book_coverage": knowledge["book"]["coverage_status"],
             "online_research_status": knowledge["online"]["status"],
@@ -754,10 +906,21 @@ def send_message_sync(
         db.commit()
         db.refresh(assistant_msg)
 
-        # 6. Pass 3: Controlled Canon Proposal Extraction
-        proposals = agent_orchestrator.extract_post_turn_proposals(
+        # 6. Pass 3: World Bible Editing & Canon Extraction
+        post_turn = agent_orchestrator.extract_post_turn_proposals(
             db, world, conv, user_msg, assistant_msg, analysis
         )
+        proposals = post_turn["staged_proposals"]
+        updated_sections = post_turn["updated_sections"]
+        contradictions = post_turn.get("detected_contradictions", [])
+
+        if updated_sections or contradictions:
+            if updated_sections:
+                meta_dict["updated_bible_sections"] = updated_sections
+            if contradictions:
+                meta_dict["detected_contradictions"] = contradictions
+            assistant_msg.metadata_json = json.dumps(meta_dict)
+            db.commit()
 
         return {
             "user_message_id": user_msg.id,
@@ -770,6 +933,8 @@ def send_message_sync(
                 "metadata": meta_dict,
                 "created_at": assistant_msg.created_at.isoformat(),
             },
+            "updated_bible_sections": updated_sections,
+            "detected_contradictions": contradictions,
             "staged_proposals": [
                 {
                     "id": p.id,
@@ -819,6 +984,7 @@ def stream_message(
                     "type": "turn_meta",
                     "primary_intent": analysis.primary_intent,
                     "permission_level": analysis.creative_permission.level,
+                    "naming_mode": analysis.creative_permission.naming_mode,
                     "active_domains": analysis.active_domains,
                     "book_coverage": knowledge["book"]["coverage_status"],
                 }
@@ -831,6 +997,7 @@ def stream_message(
                 book_retrieval=knowledge["book"],
                 online_research=knowledge["online"],
                 focused_subject_id=payload.focused_subject_id or conv.focused_subject_id,
+                conversation=conv,
             )
             contents = context_assembler.build_conversation_contents(
                 db, conv, payload.content
@@ -864,6 +1031,7 @@ def stream_message(
                 "primary_intent": analysis.primary_intent,
                 "secondary_intents": analysis.secondary_intents,
                 "permission_level": analysis.creative_permission.level,
+                "naming_mode": analysis.creative_permission.naming_mode,
                 "active_domains": analysis.active_domains,
                 "book_coverage": knowledge["book"]["coverage_status"],
                 "online_research_status": knowledge["online"]["status"],
@@ -881,13 +1049,25 @@ def stream_message(
             db.commit()
             db.refresh(assistant_msg)
 
-            proposals = agent_orchestrator.extract_post_turn_proposals(
+            post_turn = agent_orchestrator.extract_post_turn_proposals(
                 db, world, conv, user_msg, assistant_msg, analysis
             )
+            proposals = post_turn["staged_proposals"]
+            updated_sections = post_turn["updated_sections"]
+            contradictions = post_turn.get("detected_contradictions", [])
+
+            if updated_sections or contradictions:
+                if updated_sections:
+                    meta_dict["updated_bible_sections"] = updated_sections
+                if contradictions:
+                    meta_dict["detected_contradictions"] = contradictions
+                assistant_msg.metadata_json = json.dumps(meta_dict)
+                db.commit()
 
             yield "data: " + json.dumps(
                 {
                     "type": "complete",
+                    "user_message_id": user_msg.id,
                     "assistant_message": {
                         "id": assistant_msg.id,
                         "role": "ASSISTANT",
@@ -897,6 +1077,8 @@ def stream_message(
                         "metadata": meta_dict,
                         "created_at": assistant_msg.created_at.isoformat(),
                     },
+                    "updated_bible_sections": updated_sections,
+                    "detected_contradictions": contradictions,
                     "staged_proposals": [
                         {
                             "id": p.id,

@@ -14,19 +14,23 @@ class DomainCartridge(TypedDict):
 DOMAIN_CARTRIDGES: Dict[str, DomainCartridge] = {
     "linguistics": {
         "key": "linguistics",
-        "name": "Linguistics & Constructed Languages",
+        "name": "Linguistics, Onomastics & Constructed Languages",
         "analytical_lenses": (
             "Phonological inventories, phonotactic constraints, morphosyntactic alignment "
             "(nominative-accusative, ergative-absolutive, active-stative), historical sound change "
-            "(lenition, umlaut, chain shifts), sociolinguistic registers/diglossia, and writing systems."
+            "(lenition, umlaut, chain shifts), sociolinguistic registers/diglossia, writing systems, "
+            "onomastics (anthroponymy: patronymics, clan/lineage names, teknonyms, occupational bynames, "
+            "theophoric names; toponymy: hydrographic/orographic compounds, founder eponyms, phonological "
+            "erosion of older compounds), and endonyms vs. exonyms."
         ),
         "cross_domain_dependencies": (
-            "Geography (isolation vs. Sprachbund contact), Social Stratification (prestigious vs. vernacular "
-            "registers), Technology (writing media: clay, papyrus, parchment, print), Religion (liturgical languages)."
+            "Geography (isolation vs. Sprachbund contact, topographic place-naming), Social Stratification "
+            "(prestigious/liturgical vs. vernacular registers, aristocratic vs. common naming), Technology "
+            "(writing media: clay, papyrus, parchment, print, digital handles), Religion (theophoric and taboo names)."
         ),
         "book_coverage_note": (
             "INTENTIONAL BOOK GAP: Mark Rosenfelder explicitly omits conlanging from 'The Planet Construction Kit' "
-            "(deferring to 'The Language Construction Kit'). Prioritize scholarly linguistics and online research."
+            "(deferring to 'The Language Construction Kit'). Prioritize scholarly linguistics, historical etymology, and online research."
         ),
     },
     "political_science": {

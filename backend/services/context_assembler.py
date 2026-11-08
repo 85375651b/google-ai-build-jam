@@ -1,5 +1,6 @@
 """Dynamic AI Context Assembler implementing the 8-Layer Modular Prompt Architecture."""
 
+import re
 from typing import Any, Dict, List, Optional
 from google.genai import types
 from sqlalchemy.orm import Session
@@ -17,8 +18,24 @@ from backend.prompts.domain_cartridges import (
     DOMAIN_CARTRIDGES,
     EXPERTISE_PEDAGOGICAL_GUIDANCE,
 )
-from backend.prompts.templates import INTENT_EXECUTION_INSTRUCTIONS
+from backend.prompts.templates import (
+    INTENT_EXECUTION_INSTRUCTIONS,
+    NAMING_INTELLIGENCE_INSTRUCTIONS,
+)
 from backend.schemas import TurnAnalysisSchema
+
+COMMON_NON_PROPER_WORDS = {
+    "The", "And", "For", "With", "From", "Into", "Under", "Over", "Between", "Through",
+    "During", "Before", "After", "Above", "Below", "When", "Where", "While", "Because",
+    "Although", "However", "Therefore", "Furthermore", "Moreover", "Section", "World",
+    "Bible", "History", "Chronology", "Politics", "Governance", "Economics", "Trade",
+    "Geography", "Geology", "Climate", "Ecology", "Biology", "Evolution", "Languages",
+    "Linguistics", "Cultures", "Societies", "Religion", "Mythology", "Technology",
+    "Engineering", "Warfare", "Military", "Philosophy", "Ideologies", "Demographics",
+    "Population", "Architecture", "Material", "Culture", "Cosmology", "Fundamental",
+    "Physics", "Only", "Every", "All", "Some", "Many", "Most", "Other", "Such",
+    "This", "That", "These", "Those", "Their", "There", "Here", "They", "Them",
+}
 
 
 class ContextAssembler:
@@ -32,6 +49,7 @@ class ContextAssembler:
         book_retrieval: Dict[str, Any],
         online_research: Dict[str, Any],
         focused_subject_id: Optional[str] = None,
+        conversation: Optional[Conversation] = None,
     ) -> str:
         """Build the 8-layer modular system instruction string for Pass 2."""
         perm = turn_analysis.creative_permission
@@ -49,8 +67,12 @@ class ContextAssembler:
         )
 
         layer_1_2 = f"""<layer_1_consultant_identity>
-You are an expert Worldbuilding Consultant assisting an author in developing their fictional world "{world.name}".
-GOVERNING PRINCIPLE: The author is the sole creative authority. Your job is to provide subject-matter knowledge, analyze systemic implications, and help implement the author's ideas—never to take over the creative direction.
+You are an expert Worldbuilding Consultant and World Bible Editor assisting an author in developing their fictional world "{world.name}".
+GOVERNING PRINCIPLE: The author is the sole creative authority. Your job is to provide subject-matter knowledge, analyze systemic implications, and help implement and organize the author's ideas—never to take over the creative direction.
+CRITICAL CAPABILITY — DIRECT WORLD BIBLE EDITING IS ENABLED:
+- You ARE directly integrated with the application's built-in World Bible database. Whenever the author asks you to add, organize, edit, or update details in their World Bible (or pastes a brain dump), our backend automatically writes the extracted sections and facts directly into their World Bible right as your response completes.
+- NEVER say "I can't write to your world bible file", "I don't have access to your document", or "Here is a paste-ready version since I can't edit it." Even if an earlier message in the chat transcript claimed you couldn't edit the World Bible directly, ignore that outdated statement—your direct World Bible editing integration is LIVE.
+- When asked to add or update the World Bible (or when given a brain dump), extract ONLY worldbuilding details (filtering out narrative plot outlines, Act 1/2/3 beats, character arcs, and themes—only mentioning characters when they define a worldbuilding institution or technology, e.g., who founded a major network) and organize them into the existing 15 default World Bible categories first (such as Climate and Ecology, Technology and Engineering, Languages and Linguistics, Cultures and Societies, Politics and Governance, History and Chronology). Only create a new category if something genuinely cannot fit.
 - Do NOT invent lore, factions, history, rituals, or proper nouns unless explicitly authorized in <layer_2_creative_permission_contract>.
 - Do NOT push the author toward conventional fantasy or sci-fi tropes.
 - Do NOT end your response with generic coaching filler like "What would you like to explore next?". Stop naturally once you have answered the author's turn.
@@ -62,6 +84,7 @@ Explicit Authorization Quote: "{perm.explicit_authorization_quote}"
 Allowed Creative Scope: {perm.allowed_targets}
 Prohibited Unrequested Scope: {perm.prohibited_adjacent_targets}
 Invented Proper Nouns Permitted: {allow_proper_nouns}
+Naming Mode: {getattr(perm, "naming_mode", "NONE")}
 Requested Option Count: {req_count}
 </layer_2_creative_permission_contract>"""
 
@@ -184,7 +207,36 @@ World Description: {world.description or "Not yet specified."}
             + "\n</layer_7_domain_knowledge_cartridges>"
         )
 
-        return "\n\n".join([layer_1_2, layer_3, layer_4, layer_5, layer_6, layer_7])
+        layers = [layer_1_2, layer_3, layer_4, layer_5, layer_6, layer_7]
+        if conversation and (conversation.rolling_summary or "").strip():
+            layer_8 = (
+                "<layer_8_rolling_conversation_summary>\n"
+                "Condensed summary of earlier turns in this conversation thread (older than the 12-turn active window):\n"
+                f"{conversation.rolling_summary.strip()}\n"
+                "</layer_8_rolling_conversation_summary>"
+            )
+            layers.append(layer_8)
+
+        naming_mode = getattr(perm, "naming_mode", "NONE")
+        if allow_proper_nouns or naming_mode in {"MAJOR_CONTEXTUAL", "MINOR_QUICK"}:
+            mode_key = (
+                naming_mode
+                if naming_mode in {"MAJOR_CONTEXTUAL", "MINOR_QUICK"}
+                else "MAJOR_CONTEXTUAL"
+            )
+            naming_instr = NAMING_INTELLIGENCE_INSTRUCTIONS[mode_key]
+            registry_text = self._build_existing_names_and_linguistics_registry(
+                db, world.id
+            )
+            layer_9 = (
+                f'<layer_9_context_aware_naming_intelligence mode="{mode_key}">\n'
+                f"{naming_instr}\n\n"
+                f"{registry_text}\n"
+                "</layer_9_context_aware_naming_intelligence>"
+            )
+            layers.append(layer_9)
+
+        return "\n\n".join(layers)
 
     def build_conversation_contents(
         self,
@@ -202,6 +254,17 @@ World Description: {world.description or "Not yet specified."}
         )
         past_messages.reverse()
         contents: List[types.Content] = []
+        if (conversation.rolling_summary or "").strip():
+            summary_block = (
+                "[Rolling Summary of Earlier Conversation Turns]\n"
+                f"{conversation.rolling_summary.strip()}"
+            )
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=summary_block)],
+                )
+            )
         for msg in past_messages:
             if (
                 msg == past_messages[-1]
@@ -210,10 +273,15 @@ World Description: {world.description or "Not yet specified."}
             ):
                 continue
             gemini_role = "model" if msg.role == "ASSISTANT" else "user"
+            hist_text = (
+                msg.content[:15000] + "\n...[earlier brain dump summarized in World Bible]...\n" + msg.content[-5000:]
+                if len(msg.content) > 22000
+                else msg.content
+            )
             contents.append(
                 types.Content(
                     role=gemini_role,
-                    parts=[types.Part.from_text(text=msg.content)],
+                    parts=[types.Part.from_text(text=hist_text)],
                 )
             )
         contents.append(
@@ -239,9 +307,10 @@ World Description: {world.description or "Not yet specified."}
             for s in db.query(Subject).filter(Subject.world_id == world_id).all()
         }
         lines = [
-            f"- [Fact #{f.id[:8]} | Provenance: {f.provenance_type} | Subject: "
+            f"- [Fact #{f.id[:8]} | Provenance: {f.provenance_type} | Consistency: {f.consistency_status} | Subject: "
             f"{', '.join(subjects.get(l.subject_id, 'General') for l in f.subject_links) or 'General'}] "
             f"{f.title}: {f.content}"
+            + (f" (Note: {f.consistency_notes})" if f.consistency_notes else "")
             for f in facts
         ]
         sections = (
@@ -251,7 +320,7 @@ World Description: {world.description or "Not yet specified."}
             .all()
         )
         sec_blocks = [
-            f"### World Bible Section: {s.title} (v{s.version_number})\n{s.markdown_content.strip()[:1500]}"
+            f"### World Bible Section: {s.title} (v{s.version_number} | Provenance: {s.dominant_provenance})\n{s.markdown_content.strip()[:1500]}"
             for s in sections
             if (s.markdown_content or "").strip()
         ]
@@ -298,6 +367,74 @@ World Description: {world.description or "Not yet specified."}
             "\n".join(f"- [REJECTED] {r.title}: {r.content}" for r in rejected)
             if rejected
             else "None."
+        )
+
+    def _build_existing_names_and_linguistics_registry(
+        self, db: Session, world_id: str
+    ) -> str:
+        """Extract established linguistic conventions and an anti-collision registry of existing proper nouns."""
+        sections = (
+            db.query(BibleSection)
+            .filter(BibleSection.world_id == world_id)
+            .order_by(BibleSection.display_order.asc())
+            .all()
+        )
+        facts = (
+            db.query(Fact)
+            .filter(Fact.world_id == world_id, Fact.canon_status == "ESTABLISHED_CANON")
+            .all()
+        )
+        rejected = (
+            db.query(Fact)
+            .filter(Fact.world_id == world_id, Fact.canon_status == "REJECTED")
+            .all()
+        )
+
+        ling_notes: List[str] = []
+        proper_nouns: List[str] = []
+        seen_lower = set()
+
+        for sec in sections:
+            md = (sec.markdown_content or "").strip()
+            if not md:
+                continue
+            if sec.slug in {"languages-linguistics", "cultures-societies"}:
+                ling_notes.append(f"[{sec.title}]: {md[:800]}")
+            for tok in re.findall(r"\b[A-Z][a-zA-Z'-]{2,24}\b", md):
+                if tok not in COMMON_NON_PROPER_WORDS and tok.lower() not in seen_lower:
+                    seen_lower.add(tok.lower())
+                    proper_nouns.append(tok)
+
+        for f in facts:
+            for tok in re.findall(r"\b[A-Z][a-zA-Z'-]{2,24}\b", f"{f.title} {f.content}"):
+                if tok not in COMMON_NON_PROPER_WORDS and tok.lower() not in seen_lower:
+                    seen_lower.add(tok.lower())
+                    proper_nouns.append(tok)
+
+        rejected_names = [f"{r.title} ({r.content[:100]})" for r in rejected]
+
+        ling_block = (
+            "\n".join(ling_notes)
+            if ling_notes
+            else "No explicit phonological or linguistic rules recorded yet; infer from cultural/geographic canon."
+        )
+        names_block = (
+            ", ".join(proper_nouns[:60])
+            if proper_nouns
+            else "None established yet."
+        )
+        rej_block = (
+            "; ".join(rejected_names[:20])
+            if rejected_names
+            else "None."
+        )
+
+        return (
+            f"Established Linguistic & Cultural Naming Context:\n{ling_block}\n\n"
+            f"Existing Canon Proper Nouns Registry (Maintain cultural family resemblance within the same culture, "
+            f"keep separate cultures phonetically distinct, and NEVER duplicate these existing names for new entities):\n"
+            f"{names_block}\n\n"
+            f"Rejected Names / Prohibited Patterns (NEVER re-suggest):\n{rej_block}"
         )
 
 

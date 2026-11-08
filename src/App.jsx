@@ -8,6 +8,163 @@ const PERMISSION_LABELS = {
   EXPLICIT_DRAFTING: "Author-Authorized World Bible Drafting",
 };
 
+function renderInlineMarkdown(text) {
+  if (!text) return null;
+  const tokenRegex =
+    /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`\n]+`|\[(?:Book-[^\]]+|Web-\d+)\])/g;
+  const parts = String(text).split(tokenRegex);
+  return parts.map((part, idx) => {
+    if (!part) return null;
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return <strong key={idx}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
+      return <em key={idx}>{part.slice(1, -1)}</em>;
+    }
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+      return <code key={idx}>{part.slice(1, -1)}</code>;
+    }
+    if (/^\[(?:Book-[^\]]+|Web-\d+)\]$/.test(part)) {
+      return (
+        <span key={idx} className="md-inline-citation">
+          {part}
+        </span>
+      );
+    }
+    return part;
+  });
+}
+
+function FormattedMarkdown({ text }) {
+  if (!text || !String(text).trim()) {
+    return (
+      <span style={{ color: "var(--text-muted)", fontStyle: "italic" }}>
+        No content written for this section yet.
+      </span>
+    );
+  }
+  const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+  const elements = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      i += 1;
+      continue;
+    }
+
+    // Fenced code block
+    if (trimmed.startsWith("```")) {
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith("```")) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      i += 1;
+      elements.push(
+        <pre key={`code-${i}`}>
+          <code>{codeLines.join("\n")}</code>
+        </pre>
+      );
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      elements.push(<hr key={`hr-${i}`} />);
+      i += 1;
+      continue;
+    }
+
+    // Headings
+    const hMatch = trimmed.match(/^(#{1,4})\s+(.*)$/);
+    if (hMatch) {
+      const level = hMatch[1].length;
+      const content = renderInlineMarkdown(hMatch[2]);
+      if (level === 1) elements.push(<h1 key={`h1-${i}`}>{content}</h1>);
+      else if (level === 2) elements.push(<h2 key={`h2-${i}`}>{content}</h2>);
+      else if (level === 3) elements.push(<h3 key={`h3-${i}`}>{content}</h3>);
+      else elements.push(<h4 key={`h4-${i}`}>{content}</h4>);
+      i += 1;
+      continue;
+    }
+
+    // Blockquote
+    if (trimmed.startsWith("> ")) {
+      const quoteLines = [];
+      while (i < lines.length && lines[i].trim().startsWith(">")) {
+        quoteLines.push(lines[i].trim().replace(/^>\s?/, ""));
+        i += 1;
+      }
+      elements.push(
+        <blockquote key={`bq-${i}`}>
+          {renderInlineMarkdown(quoteLines.join(" "))}
+        </blockquote>
+      );
+      continue;
+    }
+
+    // Unordered list
+    if (/^[-*•]\s+/.test(trimmed)) {
+      const items = [];
+      while (i < lines.length && /^[-*•]\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^[-*•]\s+/, ""));
+        i += 1;
+      }
+      elements.push(
+        <ul key={`ul-${i}`}>
+          {items.map((it, idx) => (
+            <li key={idx}>{renderInlineMarkdown(it)}</li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    // Ordered list
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        items.push(lines[i].trim().replace(/^\d+\.\s+/, ""));
+        i += 1;
+      }
+      elements.push(
+        <ol key={`ol-${i}`}>
+          {items.map((it, idx) => (
+            <li key={idx}>{renderInlineMarkdown(it)}</li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    // Standard paragraph (collect consecutive non-special lines)
+    const paraLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !lines[i].trim().startsWith("```") &&
+      !lines[i].trim().startsWith("#") &&
+      !lines[i].trim().startsWith("> ") &&
+      !/^[-*•]\s+/.test(lines[i].trim()) &&
+      !/^\d+\.\s+/.test(lines[i].trim()) &&
+      !/^(-{3,}|\*{3,}|_{3,})$/.test(lines[i].trim())
+    ) {
+      paraLines.push(lines[i]);
+      i += 1;
+    }
+    elements.push(
+      <p key={`p-${i}`}>{renderInlineMarkdown(paraLines.join("\n"))}</p>
+    );
+  }
+
+  return <div className="md-rendered">{elements}</div>;
+}
+
 export default function App() {
   const [systemStatus, setSystemStatus] = useState(null);
   const [worlds, setWorlds] = useState([]);
@@ -54,7 +211,28 @@ export default function App() {
     () => localStorage.getItem("wb_onboarding_dismissed") !== "true"
   );
   const [uploadingBook, setUploadingBook] = useState(false);
-  const [modelInput, setModelInput] = useState("gemini-2.5-flash");
+  const [modelInput, setModelInput] = useState("claude-sonnet-5-5");
+  const [isRenamingWorld, setIsRenamingWorld] = useState(false);
+  const [editWorldName, setEditWorldName] = useState("");
+  const [editWorldDesc, setEditWorldDesc] = useState("");
+  const [editWorldGenre, setEditWorldGenre] = useState("");
+  const [worldSaveMsg, setWorldSaveMsg] = useState("");
+  const [isRenamingThread, setIsRenamingThread] = useState(false);
+  const [editThreadTitle, setEditThreadTitle] = useState("");
+  const [showRollingSummary, setShowRollingSummary] = useState(false);
+  const [lastFailedPrompt, setLastFailedPrompt] = useState("");
+  const [modelSaveMsg, setModelSaveMsg] = useState("");
+  const [bibleViewMode, setBibleViewMode] = useState("edit"); // edit | split | preview
+  const [importMsg, setImportMsg] = useState("");
+  const [darkMode, setDarkMode] = useState(
+    () => localStorage.getItem("wb_theme") !== "light"
+  );
+
+  useEffect(() => {
+    const theme = darkMode ? "dark" : "light";
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("wb_theme", theme);
+  }, [darkMode]);
 
   useEffect(() => {
     fetchSystemStatus();
@@ -82,7 +260,9 @@ export default function App() {
       const res = await fetch("/api/system/status");
       const data = await res.json();
       setSystemStatus(data);
-      if (data.gemini_model) setModelInput(data.gemini_model);
+      if (data.claude_model || data.gemini_model) {
+        setModelInput(data.claude_model || data.gemini_model);
+      }
     } catch (err) {
       console.error("Failed loading system status:", err);
     }
@@ -123,13 +303,21 @@ export default function App() {
       const consData = await consRes.json();
 
       setActiveWorldDetails(details);
+      setEditWorldName(details.name || "");
+      setEditWorldDesc(details.description || "");
+      setEditWorldGenre(details.genre_notes || "");
+      setIsRenamingWorld(false);
       setSections(secs);
       setProposals(props);
       setFacts(factsData);
       setConsistencyReport(consData);
 
       if (secs.length > 0) {
-        selectBibleSection(secs[0]);
+        const keepSec =
+          secs.find((s) => s.id === activeSectionId) || secs[0];
+        setActiveSectionId(keepSec.id);
+        setEditorTitle(keepSec.title);
+        setEditorMarkdown(keepSec.markdown_content || "");
       } else {
         setActiveSectionId("");
         setEditorTitle("");
@@ -138,7 +326,12 @@ export default function App() {
 
       setConversations(convs);
       if (convs.length > 0) {
-        setActiveConvId(convs[0].id);
+        setActiveConvId((prevConvId) => {
+          if (prevConvId && convs.some((c) => c.id === prevConvId)) {
+            return prevConvId;
+          }
+          return convs[0].id;
+        });
       } else {
         setActiveConvId("");
         setMessages([]);
@@ -190,6 +383,27 @@ export default function App() {
     }
   }
 
+  async function handleUpdateWorldDetails(e) {
+    if (e) e.preventDefault();
+    if (!activeWorldId || !editWorldName.trim()) return;
+    const res = await fetch(`/api/worlds/${activeWorldId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: editWorldName.trim(),
+        description: editWorldDesc.trim(),
+        genre_notes: editWorldGenre.trim(),
+      }),
+    });
+    if (res.ok) {
+      setIsRenamingWorld(false);
+      setWorldSaveMsg("Saved!");
+      setTimeout(() => setWorldSaveMsg(""), 2500);
+      await fetchWorlds();
+      await loadWorldWorkspace(activeWorldId);
+    }
+  }
+
   async function handleDeleteWorld() {
     if (!activeWorldId) return;
     const confirmed = window.confirm(
@@ -202,18 +416,79 @@ export default function App() {
     await fetchWorlds();
   }
 
-  async function handleSendMessage(e) {
-    e.preventDefault();
-    if (!chatInput.trim() || !activeConvId || isStreaming) return;
-    const promptText = chatInput.trim();
-    setChatInput("");
+  async function handleCreateConversation() {
+    if (!activeWorldId) return;
+    const defaultTitle = `Consultation #${conversations.length + 1}`;
+    const res = await fetch(`/api/worlds/${activeWorldId}/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: defaultTitle }),
+    });
+    if (res.ok) {
+      const created = await res.json();
+      const convsRes = await fetch(`/api/worlds/${activeWorldId}/conversations`);
+      const convs = await convsRes.json();
+      setConversations(convs);
+      setActiveConvId(created.id);
+      setIsRenamingThread(false);
+      setShowRollingSummary(false);
+    }
+  }
+
+  async function handleRenameConversation(e) {
+    if (e) e.preventDefault();
+    if (!activeConvId || !editThreadTitle.trim()) return;
+    const res = await fetch(`/api/conversations/${activeConvId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: editThreadTitle.trim() }),
+    });
+    if (res.ok) {
+      setIsRenamingThread(false);
+      const convsRes = await fetch(`/api/worlds/${activeWorldId}/conversations`);
+      setConversations(await convsRes.json());
+    }
+  }
+
+  async function handleArchiveConversation() {
+    if (!activeConvId || !activeWorldId) return;
+    const currentConv = conversations.find((c) => c.id === activeConvId);
+    const confirmed = window.confirm(
+      `Archive conversation thread "${currentConv?.title || "Current Thread"}"?`
+    );
+    if (!confirmed) return;
+    const res = await fetch(`/api/conversations/${activeConvId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_archived: true }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const convsRes = await fetch(`/api/worlds/${activeWorldId}/conversations`);
+      const convs = await convsRes.json();
+      setConversations(convs);
+      const nextId =
+        data.replacement_conversation_id || (convs.length > 0 ? convs[0].id : "");
+      setActiveConvId(nextId);
+      setIsRenamingThread(false);
+      setShowRollingSummary(false);
+    }
+  }
+
+  async function handleSendMessage(e, retryOverride = "") {
+    if (e) e.preventDefault();
+    const promptText = (retryOverride || chatInput).trim();
+    if (!promptText || !activeConvId || isStreaming) return;
+    if (!retryOverride) setChatInput("");
     setChatError("");
+    setLastFailedPrompt("");
     setIsStreaming(true);
     setStreamingText("");
     setStreamMeta(null);
 
+    const tempId = "temp-user-" + Date.now();
     const optimisticUserMsg = {
-      id: "temp-user-" + Date.now(),
+      id: tempId,
       role: "USER",
       content: promptText,
       created_at: new Date().toISOString(),
@@ -260,10 +535,17 @@ export default function App() {
           } else if (payload.type === "delta") {
             setStreamingText((prev) => prev + payload.text);
           } else if (payload.type === "complete") {
-            setMessages((prev) => [...prev, payload.assistant_message]);
+            setMessages((prev) => [
+              ...prev.map((m) =>
+                m.id === tempId && payload.user_message_id
+                  ? { ...m, id: payload.user_message_id }
+                  : m
+              ),
+              payload.assistant_message,
+            ]);
             setStreamingText("");
             setStreamMeta(null);
-            // Refresh proposals and expertise profile
+            // Refresh proposals, sections, consistency report, and expertise profile
             loadWorldWorkspace(activeWorldId);
             fetchSystemStatus();
           } else if (payload.type === "error") {
@@ -272,8 +554,10 @@ export default function App() {
         }
       }
     } catch (err) {
+      setMessages((prev) => prev.filter((m) => m.id !== tempId));
+      setLastFailedPrompt(promptText);
       if (err.name !== "AbortError") {
-        setChatError(err.message || "Failed communicating with the Gemini API.");
+        setChatError(err.message || "Failed communicating with the Claude API.");
       }
     } finally {
       setIsStreaming(false);
@@ -430,14 +714,57 @@ export default function App() {
     await loadWorldWorkspace(activeWorldId);
   }
 
+  async function handleResolveConsistencyFlag(factId) {
+    if (!activeWorldId || !factId) return;
+    const res = await fetch(
+      `/api/worlds/${activeWorldId}/consistency/facts/${factId}/resolve`,
+      { method: "POST" }
+    );
+    if (res.ok) {
+      await loadWorldWorkspace(activeWorldId);
+    }
+  }
+
   async function handleUpdateModel(e) {
     e.preventDefault();
-    await fetch("/api/system/model", {
+    const res = await fetch("/api/system/model", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ gemini_model: modelInput }),
     });
-    await fetchSystemStatus();
+    if (res.ok) {
+      setModelSaveMsg("Model updated!");
+      setTimeout(() => setModelSaveMsg(""), 2500);
+      await fetchSystemStatus();
+    }
+  }
+
+  async function handleImportProjectBundle(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportMsg("Importing project archive...");
+    try {
+      const rawText = await file.text();
+      const bundle = JSON.parse(rawText);
+      const res = await fetch("/api/worlds/import-project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(bundle),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Project import failed");
+      }
+      const restored = await res.json();
+      await fetchWorlds();
+      setActiveWorldId(restored.id);
+      setImportMsg(`Restored "${restored.name}"!`);
+      setTimeout(() => setImportMsg(""), 3500);
+    } catch (err) {
+      setImportMsg(`Error: ${err.message || "Invalid project JSON"}`);
+    } finally {
+      e.target.value = "";
+    }
   }
 
   const filteredSections = sections.filter(
@@ -447,7 +774,7 @@ export default function App() {
   );
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-theme={darkMode ? "dark" : "light"}>
       {/* Persistent Navigation & Project Sidebar */}
       <aside className="sidebar" aria-label="Project and Workspace Navigation">
         <div className="brand-header">
@@ -470,11 +797,35 @@ export default function App() {
         </select>
         <button
           className="btn btn-secondary"
-          style={{ width: "100%", marginBottom: "10px", fontSize: "0.8rem" }}
+          style={{ width: "100%", marginBottom: "6px", fontSize: "0.8rem" }}
           onClick={() => setShowNewWorldModal(true)}
         >
           + New Fictional World
         </button>
+        <label
+          className="btn btn-secondary"
+          style={{
+            width: "100%",
+            marginBottom: "10px",
+            fontSize: "0.78rem",
+            textAlign: "center",
+            display: "block",
+          }}
+          title="Restore a full world project from a .JSON backup archive"
+        >
+          Import Project (.JSON)
+          <input
+            type="file"
+            accept=".json,application/json"
+            style={{ display: "none" }}
+            onChange={handleImportProjectBundle}
+          />
+        </label>
+        {importMsg && (
+          <div style={{ fontSize: "0.75rem", color: "#a7f3d0", marginBottom: "8px" }}>
+            {importMsg}
+          </div>
+        )}
 
         <div className="sidebar-section-label">Workspace Areas</div>
         <button
@@ -548,16 +899,74 @@ export default function App() {
         {/* Topbar */}
         <header className="topbar">
           <div className="topbar-world-info">
-            <span className="topbar-world-name">
-              {activeWorldDetails?.name || "No World Selected"}
-            </span>
-            {activeWorldDetails?.description && (
-              <span style={{ fontSize: "0.84rem", color: "var(--text-secondary)" }}>
-                — {activeWorldDetails.description}
-              </span>
+            {isRenamingWorld ? (
+              <form
+                onSubmit={handleUpdateWorldDetails}
+                style={{ display: "flex", gap: "8px", alignItems: "center" }}
+              >
+                <input
+                  className="input-field"
+                  style={{ width: "220px", fontWeight: 700 }}
+                  value={editWorldName}
+                  onChange={(e) => setEditWorldName(e.target.value)}
+                  placeholder="World name..."
+                  autoFocus
+                />
+                <input
+                  className="input-field"
+                  style={{ width: "260px" }}
+                  value={editWorldDesc}
+                  onChange={(e) => setEditWorldDesc(e.target.value)}
+                  placeholder="Brief description (optional)..."
+                />
+                <button type="submit" className="btn btn-primary" style={{ padding: "6px 12px" }}>
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ padding: "6px 10px" }}
+                  onClick={() => {
+                    setEditWorldName(activeWorldDetails?.name || "");
+                    setEditWorldDesc(activeWorldDetails?.description || "");
+                    setIsRenamingWorld(false);
+                  }}
+                >
+                  Cancel
+                </button>
+              </form>
+            ) : (
+              <>
+                <span className="topbar-world-name">
+                  {activeWorldDetails?.name || "No World Selected"}
+                </span>
+                {activeWorldDetails?.description && (
+                  <span style={{ fontSize: "0.84rem", color: "var(--text-secondary)" }}>
+                    — {activeWorldDetails.description}
+                  </span>
+                )}
+                {activeWorldId && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: "3px 9px", fontSize: "0.75rem" }}
+                    onClick={() => setIsRenamingWorld(true)}
+                  >
+                    Rename
+                  </button>
+                )}
+              </>
             )}
           </div>
           <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => setDarkMode((prev) => !prev)}
+              title="Toggle Dark / Light Mode"
+            >
+              {darkMode ? "☀ Light Mode" : "☾ Dark Mode"}
+            </button>
             {activeWorldId && (
               <>
                 <a
@@ -581,6 +990,14 @@ export default function App() {
                 >
                   Export .DOCX
                 </a>
+                <a
+                  className="btn btn-secondary"
+                  href={`/api/worlds/${activeWorldId}/export-project`}
+                  download
+                  title="Download complete portable project backup (.JSON) including World Bible, revisions, facts, and conversations"
+                >
+                  Backup .JSON
+                </a>
               </>
             )}
           </div>
@@ -590,8 +1007,9 @@ export default function App() {
         {showOnboarding && (
           <div
             style={{
-              background: "#eef5fb",
-              borderBottom: "1px solid #cbe0f5",
+              background: "var(--accent-blue-bg)",
+              borderBottom: "1px solid var(--accent-blue-border)",
+              color: "var(--text-primary)",
               padding: "10px 24px",
               display: "flex",
               justifyContent: "space-between",
@@ -721,6 +1139,162 @@ export default function App() {
           {/* TAB 1: CHAT INTERFACE */}
           {activeTab === "chat" && (
             <div className="chat-column">
+              {/* Multi-Thread Conversation Bar */}
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: "10px",
+                  padding: "10px 24px",
+                  borderBottom: "1px solid var(--border-subtle)",
+                  background: "var(--bg-surface)",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <span
+                    style={{
+                      fontSize: "0.76rem",
+                      fontWeight: 700,
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                      color: "var(--text-muted)",
+                    }}
+                  >
+                    Thread:
+                  </span>
+                  {isRenamingThread ? (
+                    <form
+                      onSubmit={handleRenameConversation}
+                      style={{ display: "flex", gap: "6px", alignItems: "center" }}
+                    >
+                      <input
+                        className="input-field"
+                        style={{ width: "220px", padding: "4px 8px", fontSize: "0.84rem" }}
+                        value={editThreadTitle}
+                        onChange={(e) => setEditThreadTitle(e.target.value)}
+                        placeholder="Thread title..."
+                        autoFocus
+                      />
+                      <button
+                        type="submit"
+                        className="btn btn-primary"
+                        style={{ padding: "4px 10px", fontSize: "0.76rem" }}
+                      >
+                        Save
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        style={{ padding: "4px 8px", fontSize: "0.76rem" }}
+                        onClick={() => setIsRenamingThread(false)}
+                      >
+                        Cancel
+                      </button>
+                    </form>
+                  ) : (
+                    <>
+                      <select
+                        aria-label="Select Conversation Thread"
+                        className="input-field"
+                        style={{
+                          width: "auto",
+                          minWidth: "220px",
+                          padding: "5px 10px",
+                          fontSize: "0.84rem",
+                          fontWeight: 600,
+                        }}
+                        value={activeConvId}
+                        onChange={(e) => {
+                          setActiveConvId(e.target.value);
+                          setIsRenamingThread(false);
+                          setShowRollingSummary(false);
+                        }}
+                      >
+                        {conversations.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.title}
+                          </option>
+                        ))}
+                      </select>
+                      {activeConvId && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          style={{ padding: "4px 9px", fontSize: "0.75rem" }}
+                          onClick={() => {
+                            const curr = conversations.find((c) => c.id === activeConvId);
+                            setEditThreadTitle(curr?.title || "");
+                            setIsRenamingThread(true);
+                          }}
+                        >
+                          Rename Thread
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  {conversations.find((c) => c.id === activeConvId)?.rolling_summary && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{
+                        padding: "4px 10px",
+                        fontSize: "0.75rem",
+                        background: "var(--success-bg)",
+                        borderColor: "var(--success-border)",
+                        color: "var(--success-text)",
+                      }}
+                      onClick={() => setShowRollingSummary((prev) => !prev)}
+                      title="View condensed rolling summary of turns older than the 12-message window"
+                    >
+                      {showRollingSummary ? "Hide Rolling Summary" : "Rolling Memory Active"}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ padding: "4px 10px", fontSize: "0.76rem" }}
+                    onClick={handleCreateConversation}
+                  >
+                    + New Thread
+                  </button>
+                  {activeConvId && (
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      style={{ padding: "4px 10px", fontSize: "0.76rem" }}
+                      onClick={handleArchiveConversation}
+                    >
+                      Archive Thread
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {showRollingSummary &&
+                conversations.find((c) => c.id === activeConvId)?.rolling_summary && (
+                  <div
+                    style={{
+                      padding: "10px 24px",
+                      background: "var(--success-bg)",
+                      borderBottom: "1px solid var(--success-border)",
+                      fontSize: "0.82rem",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    <strong style={{ color: "var(--success-text)" }}>
+                      Rolling Conversation Summary (Turns Older Than 12 Messages):
+                    </strong>
+                    <div style={{ marginTop: "4px", whiteSpace: "pre-wrap" }}>
+                      {conversations.find((c) => c.id === activeConvId)?.rolling_summary}
+                    </div>
+                  </div>
+                )}
+
               <div className="messages-scroll">
                 {messages.length === 0 && !isStreaming && (
                   <div className="card-panel" style={{ marginTop: "20px" }}>
@@ -732,30 +1306,60 @@ export default function App() {
                       vocabulary or AI prompting skills required. You remain in complete creative
                       control:
                     </p>
-                    <ul
+                    <div
                       style={{
-                        marginTop: "10px",
-                        marginLeft: "20px",
-                        fontSize: "0.88rem",
-                        color: "var(--text-secondary)",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "8px",
+                        marginTop: "12px",
                       }}
                     >
-                      <li>
-                        <strong>Ask how real-world systems work:</strong>{" "}
-                        <em>&ldquo;How did medieval taxation work before standing bureaucracies?&rdquo;</em>
-                      </li>
-                      <li>
-                        <strong>Implement your own creative concept:</strong>{" "}
+                      <button
+                        type="button"
+                        className="starter-chip"
+                        onClick={() =>
+                          setChatInput(
+                            "How did medieval taxation and tribute collection work before standing bureaucracies?"
+                          )
+                        }
+                      >
+                        <strong>1. Ask how real-world systems work:</strong>{" "}
                         <em>
-                          &ldquo;I want a government where people elect their leaders, but only
+                          &ldquo;How did medieval taxation and tribute collection work before
+                          standing bureaucracies?&rdquo;
+                        </em>
+                      </button>
+                      <button
+                        type="button"
+                        className="starter-chip"
+                        onClick={() =>
+                          setChatInput(
+                            "I want a government where citizens elect their leaders, but only landowners who completed naval service can vote. How would this function in practice?"
+                          )
+                        }
+                      >
+                        <strong>2. Implement your own creative concept:</strong>{" "}
+                        <em>
+                          &ldquo;I want a government where citizens elect their leaders, but only
                           landowners who completed naval service can vote.&rdquo;
                         </em>
-                      </li>
-                      <li>
-                        <strong>Request opt-in brainstorming only when you want options:</strong>{" "}
-                        <em>&ldquo;Give me three possible ways this council could handle succession.&rdquo;</em>
-                      </li>
-                    </ul>
+                      </button>
+                      <button
+                        type="button"
+                        className="starter-chip"
+                        onClick={() =>
+                          setChatInput(
+                            "Give me three possible ways this council could handle succession without hereditary monarchy."
+                          )
+                        }
+                      >
+                        <strong>3. Request opt-in brainstorming when you want options:</strong>{" "}
+                        <em>
+                          &ldquo;Give me three possible ways this council could handle succession
+                          without hereditary monarchy.&rdquo;
+                        </em>
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -775,6 +1379,15 @@ export default function App() {
                         >
                           Mode: {PERMISSION_LABELS[m.permission_level] || m.permission_level}
                         </span>
+                        {m.metadata.naming_mode &&
+                          m.metadata.naming_mode !== "NONE" && (
+                            <span className="meta-tag perm-brainstorm">
+                              Naming:{" "}
+                              {m.metadata.naming_mode === "MINOR_QUICK"
+                                ? "Quick / Minor Naming"
+                                : "Context-Driven Major Naming"}
+                            </span>
+                          )}
                         {m.metadata.book_coverage && (
                           <span className="meta-tag">
                             Book Coverage: {m.metadata.book_coverage}
@@ -783,7 +1396,51 @@ export default function App() {
                       </div>
                     )}
 
-                    <div>{m.content}</div>
+                    {m.role === "ASSISTANT" ? (
+                      <FormattedMarkdown text={m.content} />
+                    ) : (
+                      <div>{m.content}</div>
+                    )}
+
+                    {m.role === "ASSISTANT" &&
+                      m.metadata?.updated_bible_sections &&
+                      m.metadata.updated_bible_sections.length > 0 && (
+                        <div
+                          style={{
+                            marginTop: "10px",
+                            padding: "10px 12px",
+                            background: "var(--success-bg)",
+                            border: "1px solid var(--success-border)",
+                            borderRadius: "6px",
+                            fontSize: "0.82rem",
+                          }}
+                        >
+                          <div style={{ fontWeight: 700, color: "var(--success-text)", marginBottom: "6px" }}>
+                            ✓ World Bible Automatically Updated (
+                            {m.metadata.updated_bible_sections.length} section
+                            {m.metadata.updated_bible_sections.length > 1 ? "s" : ""}):
+                          </div>
+                          <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                            {m.metadata.updated_bible_sections.map((uSec, idx) => (
+                              <button
+                                key={idx}
+                                type="button"
+                                className="btn btn-secondary"
+                                style={{ padding: "4px 10px", fontSize: "0.78rem" }}
+                                onClick={() => {
+                                  const match = sections.find(
+                                    (s) => s.id === uSec.id || s.slug === uSec.slug
+                                  );
+                                  if (match) selectBibleSection(match);
+                                  setActiveTab("bible");
+                                }}
+                              >
+                                View {uSec.title} (v{uSec.version_number}) →
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
 
                     {m.role === "ASSISTANT" &&
                       m.metadata?.citations &&
@@ -812,7 +1469,7 @@ export default function App() {
                                 <div
                                   key={`exp-${idx}`}
                                   style={{
-                                    background: "#faf8f4",
+                                    background: "var(--bg-subtle)",
                                     border: "1px solid var(--border-subtle)",
                                     borderRadius: "6px",
                                     padding: "8px 10px",
@@ -861,7 +1518,11 @@ export default function App() {
                         </span>
                       </div>
                     )}
-                    <div>{streamingText || "Consulting reference sources..."}</div>
+                    {streamingText ? (
+                      <FormattedMarkdown text={streamingText} />
+                    ) : (
+                      <div>Consulting reference sources...</div>
+                    )}
                   </div>
                 )}
 
@@ -872,9 +1533,25 @@ export default function App() {
                       background: "var(--danger-bg)",
                       borderColor: "#fecdca",
                       color: "var(--danger)",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "12px",
                     }}
                   >
-                    <strong>Error:</strong> {chatError}
+                    <div>
+                      <strong>Error:</strong> {chatError}
+                    </div>
+                    {lastFailedPrompt && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        style={{ whiteSpace: "nowrap" }}
+                        onClick={() => handleSendMessage(null, lastFailedPrompt)}
+                      >
+                        Retry Message
+                      </button>
+                    )}
                   </div>
                 )}
                 <div ref={messagesEndRef} />
@@ -1015,6 +1692,41 @@ export default function App() {
                             </span>
                           ) : null;
                         })() }
+                        <div
+                          style={{
+                            display: "inline-flex",
+                            border: "1px solid var(--border-subtle)",
+                            borderRadius: "6px",
+                            overflow: "hidden",
+                          }}
+                        >
+                          {["edit", "split", "preview"].map((mode) => (
+                            <button
+                              key={mode}
+                              type="button"
+                              onClick={() => setBibleViewMode(mode)}
+                              style={{
+                                padding: "5px 10px",
+                                fontSize: "0.76rem",
+                                fontWeight: 600,
+                                border: "none",
+                                cursor: "pointer",
+                                background:
+                                  bibleViewMode === mode
+                                    ? "var(--accent-primary)"
+                                    : "var(--bg-elevated)",
+                                color:
+                                  bibleViewMode === mode ? "#ffffff" : "var(--text-secondary)",
+                              }}
+                            >
+                              {mode === "edit"
+                                ? "Edit"
+                                : mode === "split"
+                                ? "Split"
+                                : "Preview"}
+                            </button>
+                          ))}
+                        </div>
                         <button className="btn btn-primary" onClick={handleSaveBibleSection}>
                           Save Section
                         </button>
@@ -1044,12 +1756,34 @@ export default function App() {
                       </div>
                     )}
 
-                    <textarea
-                      className="bible-textarea"
-                      placeholder="Write or edit established canon for this section in Markdown. Everything written directly here is stored with Tier-1 Author Provenance..."
-                      value={editorMarkdown}
-                      onChange={(e) => setEditorMarkdown(e.target.value)}
-                    />
+                    {bibleViewMode === "edit" && (
+                      <textarea
+                        className="bible-textarea"
+                        placeholder="Write or edit established canon for this section in Markdown. Everything written directly here is stored with Tier-1 Author Provenance..."
+                        value={editorMarkdown}
+                        onChange={(e) => setEditorMarkdown(e.target.value)}
+                      />
+                    )}
+
+                    {bibleViewMode === "preview" && (
+                      <div className="bible-preview-box">
+                        <FormattedMarkdown text={editorMarkdown} />
+                      </div>
+                    )}
+
+                    {bibleViewMode === "split" && (
+                      <div className="bible-split-grid">
+                        <textarea
+                          className="bible-textarea"
+                          placeholder="Write or edit established canon for this section in Markdown..."
+                          value={editorMarkdown}
+                          onChange={(e) => setEditorMarkdown(e.target.value)}
+                        />
+                        <div className="bible-preview-box">
+                          <FormattedMarkdown text={editorMarkdown} />
+                        </div>
+                      </div>
+                    )}
 
                     {showRevisions && (
                       <div className="card-panel" style={{ marginTop: "16px" }}>
@@ -1099,8 +1833,27 @@ export default function App() {
                         >
                           <strong>Cross-Domain Consistency Review Needed:</strong>
                           {consistencyReport.flagged_facts.map((ff) => (
-                            <div key={ff.id} style={{ marginTop: "4px" }}>
-                              • <strong>{ff.title}:</strong> {ff.consistency_notes}
+                            <div
+                              key={ff.id}
+                              style={{
+                                marginTop: "6px",
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                                gap: "10px",
+                              }}
+                            >
+                              <div>
+                                • <strong>{ff.title}:</strong> {ff.consistency_notes}
+                              </div>
+                              <button
+                                type="button"
+                                className="btn btn-secondary"
+                                style={{ padding: "3px 9px", fontSize: "0.75rem", whiteSpace: "nowrap" }}
+                                onClick={() => handleResolveConsistencyFlag(ff.id)}
+                              >
+                                Mark Reviewed
+                              </button>
                             </div>
                           ))}
                         </div>
@@ -1220,7 +1973,7 @@ export default function App() {
                     >
                       <div>
                         <strong>{s.title}</strong> ({s.domain}) —{" "}
-                        <span className="badge-pill" style={{ background: "#eee" }}>
+                        <span className="badge-pill" style={{ background: "var(--bg-subtle)" }}>
                           {s.credibility_tier}
                         </span>
                       </div>
@@ -1244,30 +1997,84 @@ export default function App() {
             <div style={{ padding: "26px", overflowY: "auto", width: "100%" }}>
               <div className="card-panel">
                 <h3 style={{ fontFamily: "var(--font-serif)", marginBottom: "8px" }}>
-                  Application & Gemini Model Configuration
+                  Application & Claude Model Configuration
                 </h3>
                 <p style={{ fontSize: "0.86rem", color: "var(--text-secondary)" }}>
-                  API keys are loaded securely from your local <code>.env</code> file and are never
-                  exposed to the browser.
+                  API keys (<code>CLAUDE_API_KEY</code> and <code>TAVILY_API_KEY</code>) are loaded
+                  securely from your local <code>.env</code> file and are never exposed to the
+                  browser.
                 </p>
                 <form
                   onSubmit={handleUpdateModel}
-                  style={{ display: "flex", gap: "10px", marginTop: "12px", maxWidth: "480px" }}
+                  style={{ display: "flex", gap: "10px", marginTop: "12px", maxWidth: "540px", alignItems: "center" }}
                 >
                   <input
                     className="input-field"
                     value={modelInput}
                     onChange={(e) => setModelInput(e.target.value)}
-                    placeholder="e.g. gemini-2.5-flash"
+                    placeholder="e.g. claude-sonnet-5-5"
                   />
-                  <button type="submit" className="btn btn-primary">
+                  <button type="submit" className="btn btn-primary" style={{ whiteSpace: "nowrap" }}>
                     Update Model
                   </button>
+                  {modelSaveMsg && (
+                    <span style={{ fontSize: "0.84rem", color: "var(--accent-primary)", fontWeight: 600 }}>
+                      {modelSaveMsg}
+                    </span>
+                  )}
                 </form>
               </div>
 
               {activeWorldDetails && (
                 <>
+                  <div className="card-panel">
+                    <h3 style={{ fontFamily: "var(--font-serif)", marginBottom: "8px" }}>
+                      World Name & Overview
+                    </h3>
+                    <form
+                      onSubmit={handleUpdateWorldDetails}
+                      style={{ display: "flex", flexDirection: "column", gap: "10px", maxWidth: "520px" }}
+                    >
+                      <div>
+                        <label style={{ fontSize: "0.82rem", fontWeight: 600 }}>World Name</label>
+                        <input
+                          className="input-field"
+                          required
+                          value={editWorldName}
+                          onChange={(e) => setEditWorldName(e.target.value)}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: "0.82rem", fontWeight: 600 }}>Description</label>
+                        <input
+                          className="input-field"
+                          value={editWorldDesc}
+                          onChange={(e) => setEditWorldDesc(e.target.value)}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ fontSize: "0.82rem", fontWeight: 600 }}>
+                          Setting / Tone Notes
+                        </label>
+                        <input
+                          className="input-field"
+                          value={editWorldGenre}
+                          onChange={(e) => setEditWorldGenre(e.target.value)}
+                        />
+                      </div>
+                      <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+                        <button type="submit" className="btn btn-primary">
+                          Save World Details
+                        </button>
+                        {worldSaveMsg && (
+                          <span style={{ fontSize: "0.84rem", color: "var(--accent-primary)", fontWeight: 600 }}>
+                            {worldSaveMsg}
+                          </span>
+                        )}
+                      </div>
+                    </form>
+                  </div>
+
                   <div className="card-panel">
                     <h3 style={{ fontFamily: "var(--font-serif)", marginBottom: "8px" }}>
                       Subject-Specific Author Expertise Profile
@@ -1311,6 +2118,35 @@ export default function App() {
                           </select>
                         </div>
                       ))}
+                    </div>
+                  </div>
+
+                  <div className="card-panel">
+                    <h3 style={{ fontFamily: "var(--font-serif)", marginBottom: "8px" }}>
+                      Project Backup & Restore Archive (.JSON)
+                    </h3>
+                    <p style={{ fontSize: "0.86rem", color: "var(--text-secondary)", marginBottom: "12px" }}>
+                      Export a complete, portable JSON backup of <strong>{activeWorldDetails.name}</strong>{" "}
+                      (including all World Bible sections, revision history, established canon facts,
+                      cross-domain dependencies, and conversation threads), or restore a backup file.
+                    </p>
+                    <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+                      <a
+                        className="btn btn-primary"
+                        href={`/api/worlds/${activeWorldId}/export-project`}
+                        download
+                      >
+                        Download Full Project Backup (.JSON)
+                      </a>
+                      <label className="btn btn-secondary" style={{ display: "inline-block" }}>
+                        Import / Restore Project Archive (.JSON)
+                        <input
+                          type="file"
+                          accept=".json,application/json"
+                          style={{ display: "none" }}
+                          onChange={handleImportProjectBundle}
+                        />
+                      </label>
                     </div>
                   </div>
 
