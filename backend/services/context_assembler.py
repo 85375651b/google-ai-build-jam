@@ -1,17 +1,13 @@
 """Dynamic AI Context Assembler implementing the 8-Layer Modular Prompt Architecture."""
 
+import json
 import re
 from typing import Any, Dict, List, Optional
-from google.genai import types
 from sqlalchemy.orm import Session
 from backend.models import (
     AuthorExpertiseProfile,
     BibleSection,
     Conversation,
-    Fact,
-    Message,
-    Subject,
-    UnresolvedQuestion,
     World,
 )
 from backend.prompts.domain_cartridges import (
@@ -23,23 +19,14 @@ from backend.prompts.templates import (
     NAMING_INTELLIGENCE_INSTRUCTIONS,
 )
 from backend.schemas import TurnAnalysisSchema
+from backend.config import settings
+from backend.services.author_intent import clear_author_decisions
+from backend.services.context_retrieval import context_retriever, ContextBudgetError, estimate_tokens
 
-COMMON_NON_PROPER_WORDS = {
-    "The", "And", "For", "With", "From", "Into", "Under", "Over", "Between", "Through",
-    "During", "Before", "After", "Above", "Below", "When", "Where", "While", "Because",
-    "Although", "However", "Therefore", "Furthermore", "Moreover", "Section", "World",
-    "Bible", "History", "Chronology", "Politics", "Governance", "Economics", "Trade",
-    "Geography", "Geology", "Climate", "Ecology", "Biology", "Evolution", "Languages",
-    "Linguistics", "Cultures", "Societies", "Religion", "Mythology", "Technology",
-    "Engineering", "Warfare", "Military", "Philosophy", "Ideologies", "Demographics",
-    "Population", "Architecture", "Material", "Culture", "Cosmology", "Fundamental",
-    "Physics", "Only", "Every", "All", "Some", "Many", "Most", "Other", "Such",
-    "This", "That", "These", "Those", "Their", "There", "Here", "They", "Them",
-}
 
 
 class ContextAssembler:
-    """Constructs token-budgeted, epistemologically segregated prompts for Gemini."""
+    """Constructs token-budgeted, epistemologically segregated prompts for the local model."""
 
     def assemble_consultant_system_prompt(
         self,
@@ -50,12 +37,17 @@ class ContextAssembler:
         online_research: Dict[str, Any],
         focused_subject_id: Optional[str] = None,
         conversation: Optional[Conversation] = None,
+        latest_user_message: str = "",
+        retrieved=None,
     ) -> str:
         """Build the 8-layer modular system instruction string for Pass 2."""
         perm = turn_analysis.creative_permission
-        allow_proper_nouns = (
-            perm.allow_invented_proper_nouns or world.allow_unrequested_proper_nouns
+        query = latest_user_message or turn_analysis.raw_user_phrasing or " ".join(
+            [perm.explicit_authorization_quote] + [d.source_quote for d in turn_analysis.author_decisions] + turn_analysis.search_queries
         )
+        retrieved = retrieved or context_retriever.retrieve(db, world.id, query, turn_analysis, conversation, focused_subject_id)
+        # Legacy world preferences cannot override this turn's author authorization.
+        allow_proper_nouns = perm.allow_invented_proper_nouns
         req_count = (
             perm.requested_option_count
             if perm.requested_option_count > 0
@@ -86,6 +78,19 @@ Prohibited Unrequested Scope: {perm.prohibited_adjacent_targets}
 Invented Proper Nouns Permitted: {allow_proper_nouns}
 Naming Mode: {getattr(perm, "naming_mode", "NONE")}
 Requested Option Count: {req_count}
+Authorization Kind: {perm.authorization_kind}
+Author-established clauses: {[d.model_dump() for d in turn_analysis.author_decisions]}
+Uncertain clauses (not canon): {turn_analysis.uncertain_statements}
+Clarification Question: {turn_analysis.clarification_question}
+- Recording author-established decisions is permitted even without creative permission.
+- SUGGEST/DRAFT authorizes only the quoted task; generated options remain non-canon.
+- DELEGATE authorizes only the quoted decision. State that decision as one plain canonical sentence
+  identifying the target, e.g. "Planet X is named Pallene." Do not decide unrelated properties.
+- Corrections and prohibitions NEVER authorize replacement names or unrelated invention.
+- Latest explicit author instructions supersede earlier permissions for the same task.
+- If intent or a referent is unclear, ask one concise clarifying question before deciding it.
+  Preserve clear decisions elsewhere in the same message; do not guess an unnamed owner.
+- Do not claim a World Bible write has succeeded before persistence is confirmed.
 </layer_2_creative_permission_contract>"""
 
         intent_instr = INTENT_EXECUTION_INSTRUCTIONS.get(
@@ -133,7 +138,9 @@ Execution Instruction: {intent_instr}
         book_status = book_retrieval.get("coverage_status", "LOW")
         book_xml_blocks = [
             f'  <passage citation_id="{p["citation_id"]}" chapter="{p["chapter_title"]}" '
-            f'section="{p["section_title"]}" book_page="{p["book_page_start"]}">\n'
+            f'section="{p["section_title"]}" book_page="{p["book_page_start"]}" '
+            f'book_page_end="{p.get("book_page_end", p["book_page_start"])}" '
+            f'pdf_page="{p.get("pdf_page_start", "unknown")}">\n'
             f'  {p["content"]}\n  </passage>'
             for p in book_passages
         ]
@@ -142,6 +149,8 @@ Execution Instruction: {intent_instr}
             if book_xml_blocks
             else "  <!-- No relevant passages in primary reference book. -->"
         )
+        book_citation_instruction = (f'Cite inline using [{book_passages[0]["citation_id"]}] and the other supplied passage IDs.'
+            if book_passages else 'No book passages were retrieved for this turn; do not invent book citations.')
 
         web_sources = online_research.get("sources", [])
         web_xml_blocks = [
@@ -157,9 +166,11 @@ Execution Instruction: {intent_instr}
 
         layer_5 = f"""<layer_5_grounded_research_and_source_policy>
 SOURCE HIERARCHY:
-1. Primary Real-World Reference: Mark Rosenfelder's "The Planet Construction Kit". Cite inline using [{book_passages[0]["citation_id"] if book_passages else "Book-pX"}].
-2. Supplementary Online Research: Cite inline using [Web-1], etc.
-3. Real-world sources explain reality; they NEVER override the author's fictional canon.
+0. The author's explicit decisions govern fictional canon absolutely.
+1. Primary Real-World Reference: Mark Rosenfelder's "The Planet Construction Kit". {book_citation_instruction}
+2. Supplementary Online Research: use only citation IDs present in the supplied web sources.
+3. General model knowledge is an unverified fallback, never independently verified research.
+Real-world sources explain reality; they NEVER override the author's fictional canon.
 
 <real_world_reference_book coverage_status="{book_status}">
 {book_xml_str}
@@ -170,9 +181,11 @@ SOURCE HIERARCHY:
 </supplementary_online_research>
 </layer_5_grounded_research_and_source_policy>"""
 
-        canon_text = self._select_relevant_canon(db, world.id)
-        unresolved_text = self._select_unresolved_and_hypotheticals(db, world.id)
-        rejected_text = self._select_rejected_ideas(db, world.id)
+        canon_text = "\n\n".join(i.text for i in retrieved.items if
+            i.kind == "fact" and i.details.get("status") == "ESTABLISHED_CANON") or "No relevant established canon retrieved."
+        unresolved_text = "\n\n".join(i.text for i in retrieved.items if i.kind in {"proposal", "question"} or
+            (i.kind == "fact" and i.details.get("status") not in {"ESTABLISHED_CANON", "REJECTED"})) or "None."
+        rejected_text = "\n\n".join(i.text for i in retrieved.items if i.kind == "fact" and i.details.get("status") == "REJECTED") or "None."
 
         layer_6 = f"""<layer_6_world_canon_and_epistemic_state>
 World Name: {world.name}
@@ -182,6 +195,10 @@ World Description: {world.description or "Not yet specified."}
 {canon_text}
 </established_world_canon>
 
+<world_bible_passages rule="PRESERVE_QUALIFICATIONS_AND_NEGATIONS; HYPOTHETICAL_WORDING_IS_NOT_CANON; FACT_STATUS_LABELS_TAKE_PRECEDENCE">
+{retrieved.render({'section'})}
+</world_bible_passages>
+
 <unresolved_and_hypothetical_context rule="NON_CANON_DO_NOT_TREAT_AS_ESTABLISHED">
 {unresolved_text}
 </unresolved_and_hypothetical_context>
@@ -189,6 +206,13 @@ World Description: {world.description or "Not yet specified."}
 <rejected_and_prohibited_ideas rule="EXPLICITLY_REJECTED_NEVER_REINTRODUCE">
 {rejected_text}
 </rejected_and_prohibited_ideas>
+
+<related_fact_relationships>
+{retrieved.render({'entity', 'structured_entity', 'relationship', 'notice'})}
+</related_fact_relationships>
+<historical_discussions rule="REFERENCE_ONLY_NOT_FRESH_AUTHORITY; AI_TEXT_IS_NOT_AUTHOR_EVIDENCE; LATEST_AUTHOR_CORRECTIONS_WIN">
+{retrieved.render({'history'})}
+</historical_discussions>
 </layer_6_world_canon_and_epistemic_state>"""
 
         cart_blocks = []
@@ -208,15 +232,6 @@ World Description: {world.description or "Not yet specified."}
         )
 
         layers = [layer_1_2, layer_3, layer_4, layer_5, layer_6, layer_7]
-        if conversation and (conversation.rolling_summary or "").strip():
-            layer_8 = (
-                "<layer_8_rolling_conversation_summary>\n"
-                "Condensed summary of earlier turns in this conversation thread (older than the 12-turn active window):\n"
-                f"{conversation.rolling_summary.strip()}\n"
-                "</layer_8_rolling_conversation_summary>"
-            )
-            layers.append(layer_8)
-
         naming_mode = getattr(perm, "naming_mode", "NONE")
         if allow_proper_nouns or naming_mode in {"MAJOR_CONTEXTUAL", "MINOR_QUICK"}:
             mode_key = (
@@ -224,9 +239,13 @@ World Description: {world.description or "Not yet specified."}
                 if naming_mode in {"MAJOR_CONTEXTUAL", "MINOR_QUICK"}
                 else "MAJOR_CONTEXTUAL"
             )
-            naming_instr = NAMING_INTELLIGENCE_INSTRUCTIONS[mode_key]
+            naming_instr = (
+                "Make only the explicitly delegated decision, within its quoted scope; do not offer or establish unrelated names."
+                if perm.authorization_kind == "DELEGATE"
+                else NAMING_INTELLIGENCE_INSTRUCTIONS[mode_key]
+            )
             registry_text = self._build_existing_names_and_linguistics_registry(
-                db, world.id
+                retrieved
             )
             layer_9 = (
                 f'<layer_9_context_aware_naming_intelligence mode="{mode_key}">\n'
@@ -239,203 +258,248 @@ World Description: {world.description or "Not yet specified."}
         return "\n\n".join(layers)
 
     def build_conversation_contents(
-        self,
-        db: Session,
-        conversation: Conversation,
-        latest_user_message: str,
-        max_recent_messages: int = 12,
-    ) -> List[types.Content]:
-        past_messages = (
-            db.query(Message)
-            .filter(Message.conversation_id == conversation.id)
-            .order_by(Message.created_at.desc())
-            .limit(max_recent_messages)
-            .all()
-        )
-        past_messages.reverse()
-        contents: List[types.Content] = []
-        if (conversation.rolling_summary or "").strip():
-            summary_block = (
-                "[Rolling Summary of Earlier Conversation Turns]\n"
-                f"{conversation.rolling_summary.strip()}"
-            )
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=summary_block)],
-                )
-            )
-        for msg in past_messages:
-            if (
-                msg == past_messages[-1]
-                and msg.role == "USER"
-                and msg.content.strip() == latest_user_message.strip()
-            ):
+        self, db: Session, conversation: Conversation, latest_user_message: str,
+        max_recent_messages: Optional[int] = None, *, retrieved=None,
+    ) -> List[Dict[str, str]]:
+        retrieved = retrieved or context_retriever.retrieve(db, conversation.world_id, latest_user_message, conversation=conversation)
+        messages = retrieved.recent[-max_recent_messages:] if max_recent_messages else retrieved.recent
+        contents = []
+        if retrieved.summary:
+            contents.append({"role": "user", "content":
+                "[Rolling Summary of Earlier Conversation Turns — reference only, not new authority; hypotheses remain non-canon]\n" + retrieved.summary})
+        for message in messages:
+            if message == messages[-1] and message.role == "USER" and message.content.strip() == latest_user_message.strip():
                 continue
-            gemini_role = "model" if msg.role == "ASSISTANT" else "user"
-            hist_text = (
-                msg.content[:15000] + "\n...[earlier brain dump summarized in World Bible]...\n" + msg.content[-5000:]
-                if len(msg.content) > 22000
-                else msg.content
-            )
-            contents.append(
-                types.Content(
-                    role=gemini_role,
-                    parts=[types.Part.from_text(text=hist_text)],
-                )
-            )
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=latest_user_message)],
-            )
-        )
+            # Preserve complete recent messages: budget overflow is handled explicitly.
+            contents.append({"role": "assistant" if message.role == "ASSISTANT" else "user", "content": message.content})
+        contents.append({"role": "user", "content": latest_user_message})
         return contents
 
-    def _select_relevant_canon(
-        self, db: Session, world_id: str, max_facts: int = 25
-    ) -> str:
-        facts = (
-            db.query(Fact)
-            .filter(Fact.world_id == world_id, Fact.canon_status == "ESTABLISHED_CANON")
-            .order_by(Fact.updated_at.desc())
-            .limit(max_facts)
-            .all()
+    @staticmethod
+    def _build_existing_names_and_linguistics_registry(retrieved):
+        return (
+            "Relevant names, aliases, cultural/linguistic context, reservations and rejected names are in Layer 6. "
+            "Their canon status and provenance remain authoritative. Naming-related retrieval is topic selection only, "
+            "never creative permission. Check relevant reservations before suggesting names; do not infer missing owners.\n"
+            + retrieved.render({'naming_registry'})
         )
-        subjects = {
-            s.id: s.name
-            for s in db.query(Subject).filter(Subject.world_id == world_id).all()
+
+    def assemble_consultation(self, db, world, analysis, book, online, conversation,
+                              latest_user_message, focused_subject_id=None):
+        retrieved = context_retriever.retrieve(db, world.id, latest_user_message, analysis, conversation, focused_subject_id)
+        budget = self.context_budget('consultation')
+        while True:
+            system = self.assemble_consultant_system_prompt(db, world, analysis, book, online,
+                focused_subject_id, conversation, latest_user_message, retrieved)
+            contents = self.build_conversation_contents(db, conversation, latest_user_message, retrieved=retrieved)
+            components = self.components(system, contents, retrieved, book, online)
+            total = sum(estimate_tokens(value) for value in components.values())
+            if total <= budget:
+                diagnostic = context_retriever.record('consultation', retrieved, components, budget,
+                    len(book.get('passages', [])), len(online.get('sources', [])))
+                return system, contents, diagnostic
+            if not self.reduce_optional(retrieved):
+                context_retriever.record('consultation', retrieved, components, budget,
+                    len(book.get('passages', [])), len(online.get('sources', [])))
+                raise ContextBudgetError('consultation', total, budget)
+
+    def assemble_extraction(self, db, world, conversation, user_msg, assistant_msg, analysis, system_instruction, schema):
+        query = user_msg.content
+        if analysis.creative_permission.authorization_kind == 'DELEGATE':
+            query += '\n' + assistant_msg.content
+        retrieved = context_retriever.retrieve(db, world.id, query, analysis, conversation,
+            exclude_message_ids=(user_msg.id, assistant_msg.id), purpose='extraction')
+        # Empty/append-only target windows let new canon use existing categories
+        # without loading their unrelated contents or replacing those contents.
+        section_targets = set()
+        domain_sections = {'geography_geology': 'geography-geology', 'astronomy': 'cosmology-physics',
+            'cosmology_physics': 'cosmology-physics', 'political_science': 'politics-governance',
+            'history': 'history-chronology', 'economics': 'economics-trade', 'linguistics': 'languages-linguistics',
+            'anthropology_sociology': 'cultures-societies', 'biology_ecology': 'biology-evolution', 'religious_studies': 'religion-mythology',
+            'physics_cosmology': 'cosmology-physics', 'technology_engineering': 'technology-engineering',
+            'military_warfare': 'warfare-military', 'architecture_material_culture': 'architecture-material-culture'}
+        section_targets.update(domain_sections[d] for d in analysis.active_domains if d in domain_sections)
+        target_terms = {
+            'cosmology-physics': r'planet|star|moon|orbit|solar|cosmology|gravity',
+            'geography-geology': r'island|islands|caldera|volcano|volcanic|mountain|coast|continent|river|geograph|geolog',
+            'climate-ecology': r'climate|ecolog|weather|smog|rain|atmospher|forest|desert',
+            'biology-evolution': r'biolog|evolution|species|genetic|organism',
+            'history-chronology': r'histor|chronolog|founded|centur|years ago',
+            'languages-linguistics': r'language|linguistic|phonolog|dialect|naming convention',
+            'cultures-societies': r'cultur|societ|character|birthday|mother|father|her name|his name',
+            'religion-mythology': r'religio|mytholog|priest|temple|worship|deit',
+            'politics-governance': r'politic|govern|kingdom|republic|empire|capital|council|treaty|alliance',
+            'economics-trade': r'econom|trade|currency|coin|grain|tax|market|silo',
+            'technology-engineering': r'technolog|engineer|network|computer|machine',
+            'warfare-military': r'war|military|army|weapon|soldier',
+            'philosophy-ideologies': r'philosoph|ideolog',
+            'demographics-population': r'demograph|population|birth rate|migration',
+            'architecture-material-culture': r'architect|building|dome|habitat|material|sealed',
         }
-        lines = [
-            f"- [Fact #{f.id[:8]} | Provenance: {f.provenance_type} | Consistency: {f.consistency_status} | Subject: "
-            f"{', '.join(subjects.get(l.subject_id, 'General') for l in f.subject_links) or 'General'}] "
-            f"{f.title}: {f.content}"
-            + (f" (Note: {f.consistency_notes})" if f.consistency_notes else "")
-            for f in facts
-        ]
-        sections = (
-            db.query(BibleSection)
-            .filter(BibleSection.world_id == world_id)
-            .order_by(BibleSection.display_order.asc())
-            .all()
-        )
-        sec_blocks = [
-            f"### World Bible Section: {s.title} (v{s.version_number} | Provenance: {s.dominant_provenance})\n{s.markdown_content.strip()[:1500]}"
-            for s in sections
-            if (s.markdown_content or "").strip()
-        ]
-        combined = ""
-        if lines:
-            combined += "Established Atomic Facts:\n" + "\n".join(lines) + "\n\n"
-        if sec_blocks:
-            combined += "Current World Bible Sections:\n" + "\n\n".join(sec_blocks)
-        return combined.strip() or "No fictional world canon has been established yet."
+        section_targets.update(slug for slug, pattern in target_terms.items() if re.search(r'\b(?:' + pattern + ')', query, re.I))
+        if re.search(r'\b(?:planet|star|moon|orbit|solar|cosmology)\b', query, re.I):
+            section_targets.add('cosmology-physics')
+        if retrieved.category == 'political':
+            section_targets.add('politics-governance')
+        if retrieved.category == 'character':
+            section_targets.add('cultures-societies')
+        if re.search(r'\b(?:naming convention|language|phonolog|linguistic)', query, re.I):
+            section_targets.add('languages-linguistics')
+        for section in db.query(BibleSection).filter(BibleSection.world_id == world.id):
+            if section.slug in section_targets and section.slug not in retrieved.section_windows:
+                end = len(section.markdown_content)
+                retrieved.section_windows[section.slug] = {'id': section.id, 'title': section.title,
+                    'version': section.version_number, 'provenance': section.dominant_provenance,
+                    'start': end, 'end': end, 'base': section.markdown_content, 'excerpt': ''}
+        budget = self.context_budget('extraction')
+        classification = analysis.model_dump(include={
+            'primary_intent', 'secondary_intents', 'ambiguity_status',
+            'creative_permission', 'uncertain_statements', 'clarification_question',
+        })
+        while True:
+            section_text = '\n\n'.join(
+                f'Section Slug: `{slug}` | Title: `{window["title"]}` | v{window["version"]} | Provenance: {window["provenance"]}\n'
+                f'Edit mode: {"REPLACE_SUPPLIED_EXCERPT" if window["excerpt"] else "APPEND_ONLY"}\n'
+                f'Current Content (focused excerpt; omitted content is preserved by backend):\n{window["excerpt"] or "(append new information only)"}'
+                for slug, window in retrieved.section_windows.items())
+            recent_text = '\n\n'.join(f'[{message.role}; earlier reference, not fresh authorization]: {message.content}' for message in retrieved.recent)
+            components = {
+                'core_instructions_and_output_schema': system_instruction + '\nReturn only JSON matching this schema:\n' + json.dumps(schema.model_json_schema()),
+                'section_edit_windows': section_text,
+                'facts_constraints_relationships': retrieved.render({'entity', 'structured_entity', 'fact', 'relationship', 'proposal', 'question', 'notice', 'naming_registry'}),
+                'conversation': recent_text + '\n' + retrieved.render({'history'}),
+                'rolling_summary': retrieved.summary,
+                'author_message_and_permission': f'Latest Author Message:\n{user_msg.content}\n\n'
+                    f'Validated Author Decisions:\n{[decision.model_dump() for decision in clear_author_decisions(analysis)]}\n\n'
+                    f'Validated classification and permission information:\n{json.dumps(classification, ensure_ascii=False)}\n',
+                'assistant_response': f'Consultant Reply (AI text, NOT author evidence):\n{assistant_msg.content}',
+                'formatting_and_edit_contract': (
+                    'Focused World Bible editing: updated_markdown replaces ONLY the supplied excerpt for that section, '
+                    'not the omitted section content. Preserve all supplied facts except the author-authorized correction. '
+                    'For APPEND_ONLY supply only new, approved text. Never rewrite an existing section not supplied here; '
+                    'use atomic proposals for additions to other categories. Historical discussion and summaries are '
+                    'reference context, not current author permission. Preserve each record\'s canon status and provenance.'),
+                'mandatory_evidence_fields': (
+                    'The backend rejects an empty, missing, paraphrased or partial source_quote. '
+                    'EVERY section edit and EVERY decision_origin=AUTHOR proposal must set source_quote to one '
+                    'of these EXACT strings, copying its punctuation, or the change cannot be saved:\n'
+                    + json.dumps([decision.source_quote for decision in clear_author_decisions(analysis)], ensure_ascii=False)
+                    + '\nFor DELEGATED proposals, copy the exact authorization quote instead: '
+                    + json.dumps(analysis.creative_permission.explicit_authorization_quote, ensure_ascii=False)
+                    + '\nSUGGESTION proposals remain non-canon. Never manufacture author evidence.'),
+            }
+            prompt = '\n\n'.join(f'{key}:\n{value}' for key, value in components.items() if key != 'core_instructions_and_output_schema')
+            components['formatting_overhead'] = ' ' * (len(prompt) - sum(len(str(value)) for key, value in components.items() if key != 'core_instructions_and_output_schema'))
+            total = sum(estimate_tokens(value) for value in components.values())
+            if total <= budget:
+                diagnostic = context_retriever.record('extraction', retrieved, components, budget)
+                return prompt, retrieved, diagnostic
+            if not self.reduce_optional(retrieved):
+                context_retriever.record('extraction', retrieved, components, budget)
+                raise ContextBudgetError('extraction', total, budget)
 
-    def _select_unresolved_and_hypotheticals(
-        self, db: Session, world_id: str
-    ) -> str:
-        hypotheticals = (
-            db.query(Fact)
-            .filter(
-                Fact.world_id == world_id,
-                Fact.canon_status.in_(["UNRESOLVED_POSSIBILITY", "HYPOTHETICAL"]),
-            )
-            .limit(10)
-            .all()
-        )
-        open_qs = (
-            db.query(UnresolvedQuestion)
-            .filter(
-                UnresolvedQuestion.world_id == world_id,
-                UnresolvedQuestion.status == "OPEN",
-            )
-            .limit(10)
-            .all()
-        )
-        lines = [f"- [{h.canon_status}] {h.title}: {h.content}" for h in hypotheticals]
-        lines += [f"- [OPEN QUESTION] {q.question_text}" for q in open_qs]
-        return "\n".join(lines) if lines else "None."
+    @staticmethod
+    def extraction_response_schema(schema, analysis):
+        """Expose existing exact-evidence choices to the structured decoder.
 
-    def _select_rejected_ideas(self, db: Session, world_id: str) -> str:
-        rejected = (
-            db.query(Fact)
-            .filter(Fact.world_id == world_id, Fact.canon_status == "REJECTED")
-            .limit(15)
-            .all()
-        )
-        return (
-            "\n".join(f"- [REJECTED] {r.title}: {r.content}" for r in rejected)
-            if rejected
-            else "None."
-        )
+        This changes only the inference schema, not persisted/API models or the
+        author-evidence validator. Missing/AI-derived evidence is never repaired.
+        """
+        quotes = [decision.source_quote for decision in clear_author_decisions(analysis)]
+        if analysis.creative_permission.explicit_authorization_quote:
+            quotes.append(analysis.creative_permission.explicit_authorization_quote)
+        quotes = list(dict.fromkeys(quotes))
+        if not quotes:
+            return schema
 
-    def _build_existing_names_and_linguistics_registry(
-        self, db: Session, world_id: str
-    ) -> str:
-        """Extract established linguistic conventions and an anti-collision registry of existing proper nouns."""
-        sections = (
-            db.query(BibleSection)
-            .filter(BibleSection.world_id == world_id)
-            .order_by(BibleSection.display_order.asc())
-            .all()
-        )
-        facts = (
-            db.query(Fact)
-            .filter(Fact.world_id == world_id, Fact.canon_status == "ESTABLISHED_CANON")
-            .all()
-        )
-        rejected = (
-            db.query(Fact)
-            .filter(Fact.world_id == world_id, Fact.canon_status == "REJECTED")
-            .all()
-        )
+        class GroundedExtractionSchema(schema):
+            @classmethod
+            def model_json_schema(cls, *args, **kwargs):
+                result = schema.model_json_schema(*args, **kwargs)
+                definitions = result.setdefault('$defs', {})
+                definitions['TurnEvidenceQuote'] = {'type': 'string', 'enum': quotes}
+                provisional = list(dict.fromkeys(quotes + analysis.uncertain_statements))
+                definitions['TurnProvisionalQuote'] = {'type':'string', 'enum':provisional}
+                for name in ('BibleSectionEditItem', 'CandidateProposalItem', 'RejectedIdeaItem', 'EntityOperation'):
+                    definition = definitions.get(name)
+                    if definition is None:
+                        continue
+                    definition['properties']['source_quote'] = {'$ref': '#/$defs/TurnProvisionalQuote' if name == 'EntityOperation' else '#/$defs/TurnEvidenceQuote'}
+                    required = definition.setdefault('required', [])
+                    if 'source_quote' not in required:
+                        required.append('source_quote')
+                return result
 
-        ling_notes: List[str] = []
-        proper_nouns: List[str] = []
-        seen_lower = set()
+        GroundedExtractionSchema.__name__ = schema.__name__
+        return GroundedExtractionSchema
 
-        for sec in sections:
-            md = (sec.markdown_content or "").strip()
-            if not md:
-                continue
-            if sec.slug in {"languages-linguistics", "cultures-societies"}:
-                ling_notes.append(f"[{sec.title}]: {md[:800]}")
-            for tok in re.findall(r"\b[A-Z][a-zA-Z'-]{2,24}\b", md):
-                if tok not in COMMON_NON_PROPER_WORDS and tok.lower() not in seen_lower:
-                    seen_lower.add(tok.lower())
-                    proper_nouns.append(tok)
+    @staticmethod
+    def expand_extracted_section_edits(extracted, retrieved, eligible=None):
+        from backend.services.llm_service import LocalModelError
+        for edit in extracted.bible_section_updates:
+            if eligible is not None and not eligible(edit):
+                continue  # Existing permission/evidence gates will discard this edit.
+            window = retrieved.section_windows.get(edit.section_slug)
+            if window is None:
+                if edit.section_slug not in retrieved.existing_section_slugs:
+                    continue  # Existing author-evidence gates still govern new custom sections.
+                # A model must not replace a section it has never seen. Atomic
+                # proposals still use the existing category routing unchanged.
+                raise LocalModelError('Extraction attempted to rewrite a section outside its retrieved context. Retry with that section explicitly identified.',
+                                      422, 'EXTRACTION_CONTEXT_SCOPE')
+            prefix = window['base'][:window['start']]
+            suffix = window['base'][window['end']:]
+            replacement = edit.updated_markdown.strip()
+            if not window['excerpt'] and prefix and replacement:
+                replacement = '\n\n' + replacement
+            edit.updated_markdown = prefix + replacement + suffix
 
-        for f in facts:
-            for tok in re.findall(r"\b[A-Z][a-zA-Z'-]{2,24}\b", f"{f.title} {f.content}"):
-                if tok not in COMMON_NON_PROPER_WORDS and tok.lower() not in seen_lower:
-                    seen_lower.add(tok.lower())
-                    proper_nouns.append(tok)
+    @staticmethod
+    def context_budget(stage):
+        settings.reload()
+        configured = settings.consultation_context_tokens if stage == 'consultation' else settings.extraction_context_tokens
+        return min(configured, settings.local_context_window - settings.local_max_output_tokens - 1024)
 
-        rejected_names = [f"{r.title} ({r.content[:100]})" for r in rejected]
+    @staticmethod
+    def reduce_optional(retrieved):
+        optional = [item for item in retrieved.items if not item.essential]
+        if optional:
+            item = min(optional, key=lambda candidate: (candidate.score, candidate.id))
+            retrieved.items.remove(item)
+            retrieved.reductions.append(f'budget: removed optional {item.kind} {item.id}')
+            return True
+        removable_recent = [message for message in retrieved.recent[:-2]
+                            if message.id not in retrieved.protected_recent_ids]
+        if removable_recent:
+            item = removable_recent[0]
+            retrieved.recent.remove(item)
+            retrieved.reductions.append(f'budget: removed older continuity message {item.id}')
+            return True
+        # Summary decisions/constraints cannot be silently sacrificed to the budget.
+        if retrieved.summary and not re.search(r"\b(?:decid\w*|establish\w*|canon|not|never|reject\w*|unresolved|open|maybe|consider\w*|reserved|chose|chosen)\b", retrieved.summary, re.I):
+            retrieved.summary = ''
+            retrieved.reductions.append('budget: removed optional summary navigation')
+            return True
+        return False
 
-        ling_block = (
-            "\n".join(ling_notes)
-            if ling_notes
-            else "No explicit phonological or linguistic rules recorded yet; infer from cultural/geographic canon."
-        )
-        names_block = (
-            ", ".join(proper_nouns[:60])
-            if proper_nouns
-            else "None established yet."
-        )
-        rej_block = (
-            "; ".join(rejected_names[:20])
-            if rejected_names
-            else "None."
-        )
-
-        return (
-            f"Established Linguistic & Cultural Naming Context:\n{ling_block}\n\n"
-            f"Existing Canon Proper Nouns Registry (Maintain cultural family resemblance within the same culture, "
-            f"keep separate cultures phonetically distinct, and NEVER duplicate these existing names for new entities):\n"
-            f"{names_block}\n\n"
-            f"Rejected Names / Prohibited Patterns (NEVER re-suggest):\n{rej_block}"
-        )
+    @staticmethod
+    def components(system, contents, retrieved, book, online):
+        # Split rendered system by its existing XML layers so estimates count each
+        # character once, including instruction and formatting overhead.
+        def layer(tag):
+            match = re.search(r'<' + tag + r'[^>]*>[\s\S]*?</' + tag + '>', system)
+            return match.group() if match else ''
+        components = {
+            'world_bible_and_history': layer('layer_6_world_canon_and_epistemic_state'),
+            'research': layer('layer_5_grounded_research_and_source_policy'),
+            'conversation': "\n".join(str(message) for message in contents),
+        }
+        remainder = system
+        for value in list(components.values())[:2]:
+            remainder = remainder.replace(value, '', 1)
+        components['core_instructions_permissions_domains'] = remainder
+        components['chat_framing'] = ' ' * (24 * (len(contents) + 1))
+        return components
 
 
 context_assembler = ContextAssembler()

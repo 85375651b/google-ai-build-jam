@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { GenerationClient, isBusyStage, isPostprocessingStage } from "./generationClient.js";
 
 const PERMISSION_LABELS = {
   FACTUAL_ONLY: "Factual Explanation Only (No Fictional Invention)",
@@ -177,12 +178,19 @@ export default function App() {
   const [activeConvId, setActiveConvId] = useState("");
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
+  const [requestStage, setRequestStage] = useState("idle");
+  const [requestNotice, setRequestNotice] = useState("");
+  const isStreaming = isBusyStage(requestStage);
   const [streamingText, setStreamingText] = useState("");
   const [streamMeta, setStreamMeta] = useState(null);
   const [chatError, setChatError] = useState("");
   const [expandedCitation, setExpandedCitation] = useState(null);
-  const abortControllerRef = useRef(null);
+  const generationClientRef = useRef(null);
+  const generationHandlers = useRef({});
+  const scopeRef = useRef({});
+  const displayedScopeRef = useRef({});
+  const workspaceRevision = useRef(0);
+  scopeRef.current = { worldId: activeWorldId, conversationId: activeConvId };
   const messagesEndRef = useRef(null);
 
   // World Bible & Proposals state
@@ -211,7 +219,7 @@ export default function App() {
     () => localStorage.getItem("wb_onboarding_dismissed") !== "true"
   );
   const [uploadingBook, setUploadingBook] = useState(false);
-  const [modelInput, setModelInput] = useState("claude-sonnet-5-5");
+  const [modelInput, setModelInput] = useState("gpt-oss:20b");
   const [isRenamingWorld, setIsRenamingWorld] = useState(false);
   const [editWorldName, setEditWorldName] = useState("");
   const [editWorldDesc, setEditWorldDesc] = useState("");
@@ -227,6 +235,90 @@ export default function App() {
   const [darkMode, setDarkMode] = useState(
     () => localStorage.getItem("wb_theme") !== "light"
   );
+
+  const matchesScope = (owner) => scopeRef.current.worldId === owner.worldId && scopeRef.current.conversationId === owner.conversationId;
+  const showSavedAnswer = (payload, owner) => {
+    if (!payload.answer_saved || !payload.assistant_message) return;
+    owner.answerSaved = true;
+    setMessages((previous) => [
+      ...previous.filter((message) => message.id !== payload.assistant_message.id).map((message) =>
+        message.id === owner.tempId ? { ...message, id: payload.user_message_id } : message),
+      payload.assistant_message,
+    ]);
+    setStreamingText("");
+  };
+  generationHandlers.current = {
+    onState(stage, message, owner) {
+      if (!matchesScope(owner)) return;
+      setRequestStage(isBusyStage(stage) ? stage : "idle");
+      setRequestNotice(stage === "complete" ? "Finished." : message);
+    },
+    onEvent(payload, owner) {
+      if (!matchesScope(owner)) return;
+      if (payload.type === "turn_meta") setStreamMeta(payload);
+      else if (payload.type === "delta") setStreamingText((previous) => previous + payload.text);
+      else if (payload.type === "answer_completed") setStreamingText(payload.text);
+      else if (payload.type === "response_saved") showSavedAnswer(payload, owner);
+      else if (["complete", "cancelled", "error"].includes(payload.type)) {
+        showSavedAnswer(payload, owner);
+        if (!payload.answer_saved) setMessages((previous) => previous.filter((message) => message.id !== owner.tempId));
+        setStreamingText("");
+        setStreamMeta(null);
+        if (payload.type === "error") {
+          setChatError(payload.message || "The request failed.");
+          setLastFailedPrompt(owner.content);
+        }
+        if (payload.type === "complete") {
+          loadWorldWorkspace(owner.worldId);
+          fetchMessages(owner.conversationId);
+          fetchSystemStatus();
+        }
+      }
+    },
+    onFailure(error, owner) {
+      if (!matchesScope(owner)) return;
+      setMessages((previous) => previous.filter((message) => message.id !== owner.tempId));
+      setStreamingText("");
+      setStreamMeta(null);
+      setChatError(error.message || "The request was interrupted.");
+      setLastFailedPrompt(owner.content);
+      fetchMessages(owner.conversationId);
+    },
+  };
+  if (!generationClientRef.current) {
+    generationClientRef.current = new GenerationClient({
+      onState: (...args) => generationHandlers.current.onState(...args),
+      onEvent: (...args) => generationHandlers.current.onEvent(...args),
+      onFailure: (...args) => generationHandlers.current.onFailure(...args),
+    });
+  }
+
+  useEffect(() => {
+    const client = generationClientRef.current;
+    const owner = client.active;
+    const previous = displayedScopeRef.current;
+    const changed = previous.worldId !== activeWorldId || previous.conversationId !== activeConvId;
+    displayedScopeRef.current = { worldId: activeWorldId, conversationId: activeConvId };
+    if (owner && !matchesScope(owner)) client.detach();
+    if (changed && (!owner || !matchesScope(owner))) {
+      workspaceRevision.current += 1;
+      setRequestStage("idle");
+      setStreamingText("");
+      setStreamMeta(null);
+      setRequestNotice("");
+      setChatError("");
+      setMessages([]);
+    }
+  }, [activeWorldId, activeConvId]);
+
+  useEffect(() => {
+    const detach = () => generationClientRef.current.detach();
+    window.addEventListener("pagehide", detach);
+    return () => {
+      window.removeEventListener("pagehide", detach);
+      detach();
+    };
+  }, []);
 
   useEffect(() => {
     const theme = darkMode ? "dark" : "light";
@@ -260,8 +352,8 @@ export default function App() {
       const res = await fetch("/api/system/status");
       const data = await res.json();
       setSystemStatus(data);
-      if (data.claude_model || data.gemini_model) {
-        setModelInput(data.claude_model || data.gemini_model);
+      if (data.local_model) {
+        setModelInput(data.local_model);
       }
     } catch (err) {
       console.error("Failed loading system status:", err);
@@ -284,6 +376,7 @@ export default function App() {
   }
 
   async function loadWorldWorkspace(worldId) {
+    const revision = workspaceRevision.current;
     try {
       const [detailsRes, secsRes, convsRes, propsRes, factsRes, consRes] =
         await Promise.all([
@@ -301,6 +394,7 @@ export default function App() {
       const props = await propsRes.json();
       const factsData = await factsRes.json();
       const consData = await consRes.json();
+      if (scopeRef.current.worldId !== worldId || workspaceRevision.current !== revision) return;
 
       setActiveWorldDetails(details);
       setEditWorldName(details.name || "");
@@ -342,9 +436,11 @@ export default function App() {
   }
 
   async function fetchMessages(convId) {
+    const revision = workspaceRevision.current;
     try {
       const res = await fetch(`/api/conversations/${convId}/messages`);
       const data = await res.json();
+      if (scopeRef.current.conversationId !== convId || workspaceRevision.current !== revision) return;
       setMessages(data);
     } catch (err) {
       console.error("Failed loading messages:", err);
@@ -478,98 +574,23 @@ export default function App() {
   async function handleSendMessage(e, retryOverride = "") {
     if (e) e.preventDefault();
     const promptText = (retryOverride || chatInput).trim();
-    if (!promptText || !activeConvId || isStreaming) return;
+    const client = generationClientRef.current;
+    if (!promptText || !activeConvId || client.active) return;
+    workspaceRevision.current += 1;
     if (!retryOverride) setChatInput("");
     setChatError("");
     setLastFailedPrompt("");
-    setIsStreaming(true);
     setStreamingText("");
     setStreamMeta(null);
-
-    const tempId = "temp-user-" + Date.now();
-    const optimisticUserMsg = {
-      id: tempId,
-      role: "USER",
-      content: promptText,
-      created_at: new Date().toISOString(),
-    };
-    setMessages((prev) => [...prev, optimisticUserMsg]);
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    try {
-      const res = await fetch(`/api/conversations/${activeConvId}/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: promptText }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        const msg =
-          errData?.detail?.message ||
-          errData?.detail ||
-          `Request failed with status ${res.status}`;
-        throw new Error(msg);
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
-
-        for (const ev of events) {
-          const line = ev.trim();
-          if (!line.startsWith("data: ")) continue;
-          const payload = JSON.parse(line.slice(6));
-          if (payload.type === "turn_meta") {
-            setStreamMeta(payload);
-          } else if (payload.type === "delta") {
-            setStreamingText((prev) => prev + payload.text);
-          } else if (payload.type === "complete") {
-            setMessages((prev) => [
-              ...prev.map((m) =>
-                m.id === tempId && payload.user_message_id
-                  ? { ...m, id: payload.user_message_id }
-                  : m
-              ),
-              payload.assistant_message,
-            ]);
-            setStreamingText("");
-            setStreamMeta(null);
-            // Refresh proposals, sections, consistency report, and expertise profile
-            loadWorldWorkspace(activeWorldId);
-            fetchSystemStatus();
-          } else if (payload.type === "error") {
-            throw new Error(payload.message || "Streaming error");
-          }
-        }
-      }
-    } catch (err) {
-      setMessages((prev) => prev.filter((m) => m.id !== tempId));
-      setLastFailedPrompt(promptText);
-      if (err.name !== "AbortError") {
-        setChatError(err.message || "Failed communicating with the Claude API.");
-      }
-    } finally {
-      setIsStreaming(false);
-      abortControllerRef.current = null;
-    }
+    const tempId = "temp-user-" + crypto.randomUUID();
+    setMessages((previous) => [...previous, {
+      id: tempId, role: "USER", content: promptText, created_at: new Date().toISOString(),
+    }]);
+    await client.start({ content: promptText, conversationId: activeConvId, worldId: activeWorldId, tempId });
   }
 
   function handleStopGeneration() {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      setIsStreaming(false);
-    }
+    void generationClientRef.current.cancel();
   }
 
   async function handleProposalDecision(proposalId, action) {
@@ -730,12 +751,14 @@ export default function App() {
     const res = await fetch("/api/system/model", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ gemini_model: modelInput }),
+      body: JSON.stringify({ local_model: modelInput }),
     });
     if (res.ok) {
       setModelSaveMsg("Model updated!");
       setTimeout(() => setModelSaveMsg(""), 2500);
       await fetchSystemStatus();
+    } else {
+      setModelSaveMsg("Unable to update model. Enter an installed Ollama model name.");
     }
   }
 
@@ -863,13 +886,13 @@ export default function App() {
           <div>
             <span
               className={`status-dot ${
-                systemStatus?.has_valid_claude_key ? "status-ok" : "status-warn"
+                systemStatus?.local_model_status?.ready ? "status-ok" : "status-warn"
               }`}
             />
-            Claude API:{" "}
-            {systemStatus?.has_valid_claude_key
-              ? `Ready (${systemStatus.claude_model || "claude-sonnet-5-5"})`
-              : "Add Key in .env"}
+            Local model:{" "}
+            {systemStatus?.local_model_status?.ready
+              ? `Ready (${systemStatus.local_model || "gpt-oss:20b"})`
+              : (systemStatus?.local_model_status?.message || "Checking Ollama…")}
           </div>
           <div style={{ marginTop: "4px" }}>
             <span
@@ -1396,10 +1419,34 @@ export default function App() {
                       </div>
                     )}
 
+                    {m.role === "ASSISTANT" && m.metadata?.request_state && m.metadata.request_state !== "complete" && (
+                      <div className="msg-meta-bar" role="status">
+                        {m.metadata.request_state === "answer_saved" ? "Answer saved; remaining updates are pending." : `Request ${m.metadata.request_state}; completed answer retained.`}
+                      </div>
+                    )}
                     {m.role === "ASSISTANT" ? (
                       <FormattedMarkdown text={m.content} />
                     ) : (
                       <div>{m.content}</div>
+                    )}
+
+                    {m.role === "ASSISTANT" && m.metadata?.canon_result && (
+                      <div className="citation-box" aria-label="World Bible update outcome">
+                        <strong>World Bible: {({ committed: "Saved", proposed: "Awaiting approval", clarification_required: "Needs clarification", error: "Not saved", failed: "Not saved", cancelled: "Cancelled" })[m.metadata.canon_result.status] || "Review required"}</strong>
+                        {!!m.metadata.canon_result.operations?.length && (
+                          <ul>
+                            {m.metadata.canon_result.operations.map((operation, index) => {
+                              const change = operation.operation || operation;
+                              return <li key={index}>
+                                {change.entity_ref || "Proposed change"}
+                                {change.property_key ? `: ${change.property_key.replaceAll("_", " ")}` : ""}
+                                {change.value !== undefined ? ` → ${typeof change.value === "string" ? change.value : JSON.stringify(change.value)}` : ""}
+                                {" — "}{operation.state === "committed" ? "Saved" : operation.state === "proposed" ? "Awaiting approval" : "Not applied"}
+                              </li>;
+                            })}
+                          </ul>
+                        )}
+                      </div>
                     )}
 
                     {m.role === "ASSISTANT" &&
@@ -1505,7 +1552,7 @@ export default function App() {
                 ))}
 
                 {isStreaming && (
-                  <div className="msg-card msg-assistant">
+                  <div className="msg-card msg-assistant" aria-live="polite">
                     {streamMeta && (
                       <div className="msg-meta-bar">
                         <span className="meta-tag perm-strict">
@@ -1521,9 +1568,13 @@ export default function App() {
                     {streamingText ? (
                       <FormattedMarkdown text={streamingText} />
                     ) : (
-                      <div>Consulting reference sources...</div>
+                      <div>{requestNotice || "Preparing response…"}</div>
                     )}
                   </div>
+                )}
+
+                {requestNotice && (
+                  <div role="status" style={{ padding: "8px", color: "var(--text-secondary)" }}>{requestNotice}</div>
                 )}
 
                 {chatError && (
@@ -1571,13 +1622,21 @@ export default function App() {
                       }
                     }}
                   />
-                  {isStreaming ? (
+                  {isPostprocessingStage(requestStage) ? (
+                    <>
+                      <button type="button" className="btn btn-secondary" disabled>
+                        {requestStage === "postprocessing" ? (requestNotice || "Updating World Bible…") : requestStage === "committing" ? "Finishing updates…" : "Saving response…"}
+                      </button>
+                      <button type="button" className="btn btn-danger" onClick={handleStopGeneration}>Cancel update</button>
+                    </>
+                  ) : isStreaming ? (
                     <button
                       type="button"
                       className="btn btn-danger"
                       onClick={handleStopGeneration}
+                      disabled={requestStage === "cancelling"}
                     >
-                      Stop
+                      {requestStage === "cancelling" ? "Cancelling…" : "Stop"}
                     </button>
                   ) : (
                     <button
@@ -1928,7 +1987,7 @@ export default function App() {
                         <div style={{ fontSize: "0.82rem", color: "var(--text-secondary)" }}>
                           Status: <strong>{doc.ingestion_status}</strong> | Extracted Pages:{" "}
                           {doc.total_pages} | Semantic Passages Indexed: {doc.total_chunks} |
-                          Vector Embeddings: {doc.embeddings_count}
+                          Retrieval: local full-text search
                         </div>
                       </div>
                     </div>
@@ -1997,12 +2056,12 @@ export default function App() {
             <div style={{ padding: "26px", overflowY: "auto", width: "100%" }}>
               <div className="card-panel">
                 <h3 style={{ fontFamily: "var(--font-serif)", marginBottom: "8px" }}>
-                  Application & Claude Model Configuration
+                  Application & Local Model Configuration
                 </h3>
                 <p style={{ fontSize: "0.86rem", color: "var(--text-secondary)" }}>
-                  API keys (<code>CLAUDE_API_KEY</code> and <code>TAVILY_API_KEY</code>) are loaded
-                  securely from your local <code>.env</code> file and are never exposed to the
-                  browser.
+                  Run Ollama locally and download a model before selecting it here. No model API key
+                  is required. Model selection is saved locally. Tavily web research is optional;
+                  leave its key empty to work offline.
                 </p>
                 <form
                   onSubmit={handleUpdateModel}
@@ -2012,7 +2071,7 @@ export default function App() {
                     className="input-field"
                     value={modelInput}
                     onChange={(e) => setModelInput(e.target.value)}
-                    placeholder="e.g. claude-sonnet-5-5"
+                    placeholder="e.g. gpt-oss:20b"
                   />
                   <button type="submit" className="btn btn-primary" style={{ whiteSpace: "nowrap" }}>
                     Update Model

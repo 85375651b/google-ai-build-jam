@@ -117,7 +117,7 @@ class ResearchService:
                         title=title[:300],
                         domain=domain[:150],
                         source_credibility_tier=cred_tier,
-                        extracted_excerpt=excerpt[:2000],
+                        extracted_excerpt=excerpt,
                         consensus_status="CONSENSUS",
                     )
                     db.add(existing)
@@ -132,7 +132,7 @@ class ResearchService:
                         "url": existing.url,
                         "domain": existing.domain,
                         "credibility_tier": existing.source_credibility_tier,
-                        "excerpt": existing.extracted_excerpt,
+                        "excerpt": excerpt,
                         "citation_label": f"{existing.title} ({existing.domain})",
                     }
                 )

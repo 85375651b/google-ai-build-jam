@@ -1,7 +1,6 @@
-"""Reference book ingestion, OCR fallback, structural chunking, and hybrid RAG retrieval."""
+"""Reference book ingestion, OCR fallback, structural chunking, and local RAG retrieval."""
 
 import hashlib
-import json
 import logging
 from pathlib import Path
 import re
@@ -9,12 +8,10 @@ import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 import pymupdf as fitz  # PyMuPDF
-import numpy as np
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from backend.config import settings
 from backend.models import ReferenceChunk, ReferenceDocument
-from backend.services.gemini_service import GeminiServiceError, gemini_service
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +60,7 @@ def _clean_ocr_text(raw_text: str) -> str:
 
 
 class BookIngestionService:
-    """Ingests reference books (PDF/TXT/MD), preserves structure, and performs hybrid RAG retrieval."""
+    """Ingests reference books (PDF/TXT/MD), preserves structure, and performs local RAG retrieval."""
 
     def compute_file_hash(self, file_path: Path) -> str:
         hasher = hashlib.sha256()
@@ -73,7 +70,7 @@ class BookIngestionService:
         return hasher.hexdigest()
 
     def ensure_primary_book_ingested(
-        self, db: Session, generate_embeddings: bool = False
+        self, db: Session
     ) -> Optional[ReferenceDocument]:
         """Ensure the default reference book in the repository is ingested into KnowledgeDB."""
         book_path = settings.primary_reference_book_path
@@ -88,8 +85,6 @@ class BookIngestionService:
             .first()
         )
         if existing and existing.ingestion_status == "INDEXED" and existing.total_chunks > 0:
-            if generate_embeddings and existing.embeddings_count == 0 and settings.has_valid_gemini_key:
-                self.generate_missing_embeddings(db, existing.id)
             return existing
 
         return self.ingest_document(
@@ -97,7 +92,6 @@ class BookIngestionService:
             file_path=book_path,
             title="The Planet Construction Kit",
             author="Mark Rosenfelder",
-            generate_embeddings=generate_embeddings,
         )
 
     def ingest_document(
@@ -106,7 +100,6 @@ class BookIngestionService:
         file_path: Path,
         title: Optional[str] = None,
         author: Optional[str] = None,
-        generate_embeddings: bool = False,
     ) -> ReferenceDocument:
         """Execute the 9-stage ingestion pipeline on a reference document."""
         if not file_path.exists():
@@ -166,9 +159,6 @@ class BookIngestionService:
             doc_record.total_chunks = chunks_created
             doc_record.ingestion_status = "INDEXED"
             db.commit()
-
-            if generate_embeddings and settings.has_valid_gemini_key:
-                self.generate_missing_embeddings(db, doc_record.id)
 
             db.refresh(doc_record)
             return doc_record
@@ -417,56 +407,6 @@ class BookIngestionService:
         )
         return child
 
-    def generate_missing_embeddings(
-        self, db: Session, document_id: str, max_chunks: int = 1500
-    ) -> int:
-        """Generate Gemini embeddings for child chunks that do not yet have vectors."""
-        if not settings.has_valid_gemini_key:
-            return 0
-        unembedded = (
-            db.query(ReferenceChunk)
-            .filter(
-                ReferenceChunk.document_id == document_id,
-                ReferenceChunk.chunk_level == "CHILD_PASSAGE",
-                ReferenceChunk.embedding_json.is_(None),
-            )
-            .limit(max_chunks)
-            .all()
-        )
-        if not unembedded:
-            return 0
-
-        texts_to_embed = [
-            f"[Book Chapter: {c.chapter_title} | Section: {c.section_title}]\n{c.content}"
-            for c in unembedded
-        ]
-        try:
-            vectors = gemini_service.embed_texts(
-                texts_to_embed, task_type="RETRIEVAL_DOCUMENT", batch_size=50
-            )
-            for chunk_obj, vec in zip(unembedded, vectors):
-                chunk_obj.embedding_json = json.dumps(vec)
-
-            doc_obj = (
-                db.query(ReferenceDocument)
-                .filter(ReferenceDocument.id == document_id)
-                .first()
-            )
-            if doc_obj:
-                doc_obj.embeddings_count = (
-                    db.query(ReferenceChunk)
-                    .filter(
-                        ReferenceChunk.document_id == document_id,
-                        ReferenceChunk.embedding_json.is_not(None),
-                    )
-                    .count()
-                )
-            db.commit()
-            return len(vectors)
-        except GeminiServiceError as exc:
-            logger.warning("Embedding generation deferred or failed: %s", exc.message)
-            return 0
-
     # -------------------------------------------------------------------------
     # Hybrid Retrieval & Deterministic Coverage Evaluation (Step 1 & Step 2)
     # -------------------------------------------------------------------------
@@ -478,7 +418,7 @@ class BookIngestionService:
         active_domains: Optional[List[str]] = None,
         top_k: int = 5,
     ) -> Dict[str, Any]:
-        """Retrieve relevant reference book passages using Hybrid BM25 + Vector + Reranking.
+        """Retrieve relevant reference book passages using local BM25 + lexical reranking.
 
         Also evaluates deterministic Book Coverage (HIGH, PARTIAL, LOW) per Step 1 Section 4.3
         and Step 2 Section 6.1 (Guard 2: suppresses low-relevance chunks).
@@ -535,44 +475,7 @@ class BookIngestionService:
         except Exception as exc:
             logger.debug("FTS5 query fallback: %s", exc)
 
-        # 2. Vector Cosine Similarity (if chunk embeddings exist and Gemini API key is configured)
-        vec_candidates: Dict[str, float] = {}
-        embedded_count = (
-            db.query(ReferenceChunk)
-            .filter(
-                ReferenceChunk.chunk_level == "CHILD_PASSAGE",
-                ReferenceChunk.embedding_json.is_not(None),
-            )
-            .count()
-        )
-        if embedded_count > 0 and settings.has_valid_gemini_key:
-            try:
-                q_vec = np.array(gemini_service.embed_query(" ".join(queries)), dtype=np.float32)
-                q_norm = np.linalg.norm(q_vec)
-                if q_norm > 0:
-                    all_embedded = (
-                        db.query(ReferenceChunk.id, ReferenceChunk.embedding_json)
-                        .filter(
-                            ReferenceChunk.chunk_level == "CHILD_PASSAGE",
-                            ReferenceChunk.embedding_json.is_not(None),
-                        )
-                        .all()
-                    )
-                    scored_vecs: List[Tuple[str, float]] = []
-                    for cid, emb_json in all_embedded:
-                        c_vec = np.array(json.loads(emb_json), dtype=np.float32)
-                        denom = q_norm * np.linalg.norm(c_vec)
-                        if denom > 0:
-                            sim = float(np.dot(q_vec, c_vec) / denom)
-                            scored_vecs.append((cid, sim))
-                    scored_vecs.sort(key=lambda x: x[1], reverse=True)
-                    for rank_idx, (cid, sim) in enumerate(scored_vecs[:30]):
-                        if sim >= 0.45:
-                            vec_candidates[cid] = (1.0 / (15 + rank_idx)) + (sim * 0.5)
-            except Exception as exc:
-                logger.debug("Vector query skipped, using BM25 + lexical reranker: %s", exc)
-
-        candidate_ids = set(fts_candidates.keys()) | set(vec_candidates.keys())
+        candidate_ids = set(fts_candidates)
         if not candidate_ids:
             return {
                 "coverage_status": "LOW",
@@ -603,7 +506,7 @@ class BookIngestionService:
 
             lexical_coverage = len(matched_kws) / max(1, min(len(kw_set), 5))
             header_bonus = min(0.25, len(header_hits) * 0.12)
-            rrf_component = fts_candidates.get(chunk.id, 0.0) * 4.0 + vec_candidates.get(chunk.id, 0.0) * 3.0
+            rrf_component = fts_candidates.get(chunk.id, 0.0) * 4.0
 
             rerank_score = min(1.0, (lexical_coverage * 0.55) + header_bonus + rrf_component)
 

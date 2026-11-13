@@ -1,0 +1,60 @@
+{
+  "method": "ceil(UTF-8 bytes / 3), same chat framing; complete consultation input; extraction includes output schema; synthetic world, real book passages for factual case; no inference",
+  "before_source_sha256": "553c740e40db00f579cc14762f4b87dc888d463e635dd604675a061cdd6e8090",
+  "consultation": [
+    {
+      "request": "short naming correction",
+      "before": 20541,
+      "after": 2990,
+      "reduction_percent": 85.4,
+      "facts_after": 2,
+      "history_excerpts_after": 2
+    },
+    {
+      "request": "factual research",
+      "before": 22255,
+      "after": 4549,
+      "reduction_percent": 79.6,
+      "facts_after": 0,
+      "history_excerpts_after": 2
+    },
+    {
+      "request": "character development",
+      "before": 20483,
+      "after": 2947,
+      "reduction_percent": 85.6,
+      "facts_after": 1,
+      "history_excerpts_after": 3
+    },
+    {
+      "request": "political worldbuilding",
+      "before": 20492,
+      "after": 2945,
+      "reduction_percent": 85.6,
+      "facts_after": 2,
+      "history_excerpts_after": 2
+    },
+    {
+      "request": "cross-entity consistency",
+      "before": 20413,
+      "after": 2863,
+      "reduction_percent": 86.0,
+      "facts_after": 2,
+      "history_excerpts_after": 2
+    },
+    {
+      "request": "historical conversation",
+      "before": 20410,
+      "after": 3021,
+      "reduction_percent": 85.2,
+      "facts_after": 2,
+      "history_excerpts_after": 3
+    }
+  ],
+  "extraction": {
+    "request": "short naming correction",
+    "before": 41845,
+    "after": 5054,
+    "reduction_percent": 87.9
+  }
+}

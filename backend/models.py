@@ -571,3 +571,128 @@ class FactCitation(Base):
     citation_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     fact: Mapped["Fact"] = relationship("Fact", back_populates="citations")
+
+
+class GenerationRequest(Base):
+    """Small durable lifecycle journal; world/canon tables remain unchanged."""
+    __tablename__ = "generation_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    world_id: Mapped[str] = mapped_column(String(36), ForeignKey("worlds.id", ondelete="CASCADE"), nullable=False)
+    # Unique while active; NULL after terminal state. Works without a new queue/service.
+    active_conversation: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, unique=True)
+    fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    terminal_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow)
+
+
+class CanonRecord:
+    """Shared audit fields; source quotes are evidence, never model authorization."""
+    provenance: Mapped[str] = mapped_column(String(40), default='AUTHOR_CREATED')
+    canon_status: Mapped[str] = mapped_column(String(40), default='ESTABLISHED_CANON')
+    source_quote: Mapped[str] = mapped_column(Text, default='')
+    source_message_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    version_number: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class Entity(Base, CanonRecord):
+    __tablename__ = 'entities'
+    __table_args__ = (UniqueConstraint('world_id', 'reference_key'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'), index=True)
+    reference_label: Mapped[str] = mapped_column(String(200))
+    reference_key: Mapped[str] = mapped_column(String(200))
+    entity_type: Mapped[str] = mapped_column(String(40), index=True)
+    scope_key: Mapped[str] = mapped_column(String(200), default='world')
+    legacy_subject_id: Mapped[Optional[str]] = mapped_column(ForeignKey('subjects.id', ondelete='SET NULL'), nullable=True)
+
+
+class EntityProperty(Base, CanonRecord):
+    __tablename__ = 'entity_properties'
+    __table_args__ = (UniqueConstraint('entity_id', 'property_key'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    entity_id: Mapped[str] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), index=True)
+    property_key: Mapped[str] = mapped_column(String(100))
+    value_json: Mapped[str] = mapped_column(Text, default='null')
+    fact_id: Mapped[Optional[str]] = mapped_column(ForeignKey('facts.id', ondelete='SET NULL'), nullable=True)
+
+
+class EntityName(Base, CanonRecord):
+    __tablename__ = 'entity_names'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'), index=True)
+    entity_id: Mapped[str] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    normalized_name: Mapped[str] = mapped_column(String(200), index=True)
+    kind: Mapped[str] = mapped_column(String(24))
+    scope_key: Mapped[str] = mapped_column(String(200))
+    # Nullable for nonexclusive aliases/former/rejected names. DB enforces claims.
+    claim_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True)
+
+
+class EntityRelationship(Base, CanonRecord):
+    __tablename__ = 'entity_relationships'
+    __table_args__ = (UniqueConstraint('source_entity_id', 'target_entity_id', 'relationship_type'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'), index=True)
+    source_entity_id: Mapped[str] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), index=True)
+    target_entity_id: Mapped[str] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), index=True)
+    relationship_type: Mapped[str] = mapped_column(String(60))
+    details_json: Mapped[str] = mapped_column(Text, default='{}')
+
+
+class EntityConstraint(Base, CanonRecord):
+    __tablename__ = 'entity_constraints'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'), index=True)
+    entity_id: Mapped[str] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), index=True)
+    constraint_type: Mapped[str] = mapped_column(String(60))
+    value_json: Mapped[str] = mapped_column(Text)
+
+
+class EntityRevision(Base):
+    __tablename__ = 'entity_revisions'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    entity_id: Mapped[str] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), index=True)
+    batch_id: Mapped[str] = mapped_column(String(36))
+    version_number: Mapped[int] = mapped_column(Integer)
+    previous_json: Mapped[str] = mapped_column(Text)
+    new_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CanonOperationBatch(Base):
+    __tablename__ = 'canon_operation_batches'
+    __table_args__ = (UniqueConstraint('world_id', 'idempotency_key'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(160))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32))
+    operations_json: Mapped[str] = mapped_column(Text)
+    result_json: Mapped[str] = mapped_column(Text, default='{}')
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class NamingPolicy(Base):
+    __tablename__ = 'naming_policies'
+    __table_args__ = (UniqueConstraint('world_id', 'entity_type'),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'))
+    entity_type: Mapped[str] = mapped_column(String(40))
+    canonical_unique: Mapped[bool] = mapped_column(Boolean, default=True)
+    aliases_unique: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class CanonSyncIssue(Base):
+    __tablename__ = 'canon_sync_issues'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    world_id: Mapped[str] = mapped_column(ForeignKey('worlds.id', ondelete='CASCADE'), index=True)
+    entity_id: Mapped[Optional[str]] = mapped_column(ForeignKey('entities.id', ondelete='CASCADE'), nullable=True)
+    section_id: Mapped[Optional[str]] = mapped_column(ForeignKey('bible_sections.id', ondelete='CASCADE'), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default='OPEN')
+    detail: Mapped[str] = mapped_column(Text)

@@ -3,9 +3,9 @@
 import pytest
 from fastapi.testclient import TestClient
 from backend.main import app
-from backend.schemas import CreativePermissionSchema, TurnAnalysisSchema
+from backend.schemas import AuthorDecisionSchema, CreativePermissionSchema, TurnAnalysisSchema
 from backend.services.agent_orchestrator import agent_orchestrator
-from backend.services.gemini_service import gemini_service
+from backend.services.llm_service import llm_service
 
 client = TestClient(app)
 
@@ -15,7 +15,7 @@ def test_system_status_and_ingested_reference_book():
     res = client.get("/api/system/status")
     assert res.status_code == 200
     data = res.json()
-    assert "has_valid_gemini_key" in data
+    assert data["llm_provider"] == "ollama"
     assert len(data["reference_documents"]) >= 1
     book = data["reference_documents"][0]
     assert book["title"] == "The Planet Construction Kit"
@@ -98,7 +98,7 @@ def test_creative_permission_guard_and_citation_verification(monkeypatch):
     convs = client.get(f"/api/worlds/{w['id']}/conversations").json()
     cid = convs[0]["id"]
 
-    # Mock Gemini structured & text calls to verify orchestrator guards deterministically
+    # Mock local model structured & text calls to verify orchestrator guards deterministically
     def fake_structured(prompt, response_schema, **kwargs):
         if response_schema.__name__ == "TurnAnalysisSchema":
             # Simulate an over-eager model trying to set BOUNDED_BRAINSTORMING on a factual question
@@ -118,9 +118,9 @@ def test_creative_permission_guard_and_citation_verification(monkeypatch):
             )
         raise AssertionError("Pass 3 should be blocked by Guard 5 on QUESTION_EXPLANATION")
 
-    monkeypatch.setattr(gemini_service, "generate_structured", fake_structured)
+    monkeypatch.setattr(llm_service, "generate_structured", fake_structured)
     monkeypatch.setattr(
-        gemini_service,
+        llm_service,
         "generate_text",
         lambda contents, system_instruction, **kw: (
             "In pre-modern states, rulers collected taxes in kind or via labor [Book-p112].\n\n"
@@ -178,6 +178,7 @@ def test_brain_dump_automatically_edits_world_bible_sections(monkeypatch):
                     section_slug="geography-geology",
                     section_title="Geography and Geology",
                     updated_markdown="### Vaelor Caldera\n\nThe capital city of Vaelor is built inside an active volcanic caldera.",
+                    source_quote="Brain dump: Vaelor is built inside a volcanic caldera and priests control the grain silos and use obsidian coins.",
                     summary_of_changes="Added Vaelor caldera geography from brain dump",
                     provenance="AUTHOR_CREATED",
                 ),
@@ -185,6 +186,7 @@ def test_brain_dump_automatically_edits_world_bible_sections(monkeypatch):
                     section_slug="economics-trade",
                     section_title="Economics and Trade",
                     updated_markdown="### Temple Granaries & Currency\n\nThe priesthood controls all central grain silos and issues obsidian coins.",
+                    source_quote="Brain dump: Vaelor is built inside a volcanic caldera and priests control the grain silos and use obsidian coins.",
                     summary_of_changes="Added temple granaries and obsidian currency from brain dump",
                     provenance="AUTHOR_CREATED",
                 ),
@@ -192,6 +194,7 @@ def test_brain_dump_automatically_edits_world_bible_sections(monkeypatch):
             proposals=[
                 CandidateProposalItem(
                     proposal_type="NEW_FACT",
+                    source_quote="Brain dump: Vaelor is built inside a volcanic caldera and priests control the grain silos and use obsidian coins.",
                     proposed_title="Vaelor Caldera Location",
                     proposed_content="The capital city of Vaelor is built inside a volcanic caldera.",
                     proposed_provenance="AUTHOR_CREATED",
@@ -201,9 +204,9 @@ def test_brain_dump_automatically_edits_world_bible_sections(monkeypatch):
             ],
         )
 
-    monkeypatch.setattr(gemini_service, "generate_structured", fake_structured)
+    monkeypatch.setattr(llm_service, "generate_structured", fake_structured)
     monkeypatch.setattr(
-        gemini_service,
+        llm_service,
         "generate_text",
         lambda contents, system_instruction, **kw: "I have extracted your brain dump and updated the Geography and Economics sections of your World Bible.",
     )
@@ -305,6 +308,9 @@ def test_rolling_summary_dependencies_contradictions_and_multi_thread(monkeypatc
                     primary_intent="CANON_DECLARATION",
                     secondary_intents=[],
                     ambiguity_status="CLEAR",
+                    author_decisions=[AuthorDecisionSchema(
+                        kind="DECLARATION", source_quote="Trade convoys depend on Perpetual Acid Smog filters, and the sky is crystal clear."
+                    )],
                     raw_user_phrasing="Trade convoys depend on Perpetual Acid Smog filters, and the sky is crystal clear.",
                     inferred_domain_concepts=["trade convoys"],
                     creative_permission=CreativePermissionSchema(level="ANALYTICAL_ADVISORY"),
@@ -317,6 +323,7 @@ def test_rolling_summary_dependencies_contradictions_and_multi_thread(monkeypatc
                 proposals=[
                     CandidateProposalItem(
                         proposal_type="NEW_FACT",
+                        source_quote="Trade convoys depend on Perpetual Acid Smog filters, and the sky is crystal clear.",
                         proposed_title="Filtered Convoy Network",
                         proposed_content="Overland trade convoys require heavy filtration units because of the Perpetual Acid Smog.",
                         proposed_provenance="AUTHOR_CREATED",
@@ -334,9 +341,9 @@ def test_rolling_summary_dependencies_contradictions_and_multi_thread(monkeypatc
                 ],
             )
 
-        monkeypatch.setattr(gemini_service, "generate_structured", fake_structured)
+        monkeypatch.setattr(llm_service, "generate_structured", fake_structured)
         monkeypatch.setattr(
-            gemini_service,
+            llm_service,
             "generate_text",
             lambda contents, system_instruction, **kw: (
                 "Condensed summary: Author established sealed dome habitats and Perpetual Acid Smog."
@@ -355,14 +362,14 @@ def test_rolling_summary_dependencies_contradictions_and_multi_thread(monkeypatc
         convs_updated = client.get(f"/api/worlds/{w['id']}/conversations").json()
         assert "Condensed summary:" in convs_updated[0]["rolling_summary"]
 
-        # Verify ContextAssembler includes rolling_summary in both system prompt and conversation contents
+        # Verify the single rolling summary is included in conversation contents
         db = SessionLocal()
         try:
             conv_obj = db.query(Conversation).filter(Conversation.id == c1_id).first()
             built_contents = context_assembler.build_conversation_contents(
                 db, conv_obj, "Follow-up question"
             )
-            assert "Rolling Summary of Earlier Conversation Turns" in built_contents[0].parts[0].text
+            assert "Rolling Summary of Earlier Conversation Turns" in built_contents[0]["content"]
         finally:
             db.close()
 
@@ -404,9 +411,9 @@ def test_step5_clarification_scoped_brainstorming_and_proposal_approval(monkeypa
                 )
             return PostTurnExtractionSchema(bible_section_updates=[], proposals=[])
 
-        monkeypatch.setattr(gemini_service, "generate_structured", fake_structured_vague)
+        monkeypatch.setattr(llm_service, "generate_structured", fake_structured_vague)
         monkeypatch.setattr(
-            gemini_service,
+            llm_service,
             "generate_text",
             lambda contents, system_instruction, **kw: (
                 "To help structure your religion, could you clarify whether deities are empirically active "
@@ -463,9 +470,9 @@ def test_step5_clarification_scoped_brainstorming_and_proposal_approval(monkeypa
                 ],
             )
 
-        monkeypatch.setattr(gemini_service, "generate_structured", fake_structured_brainstorm)
+        monkeypatch.setattr(llm_service, "generate_structured", fake_structured_brainstorm)
         monkeypatch.setattr(
-            gemini_service,
+            llm_service,
             "generate_text",
             lambda contents, system_instruction, **kw: "Here are three scoped options for temple tithes...",
         )
@@ -513,7 +520,7 @@ def test_step5_manual_bible_override_precedence_and_non_destructive_impact():
     """Verify Step 5 Tests 6, 8, 9: Manual World Bible edit precedence, dependency review propagation, and source retrieval."""
     from backend.database import SessionLocal
     from backend.models import World
-    from backend.schemas import CreativePermissionSchema, TurnAnalysisSchema
+    from backend.schemas import AuthorDecisionSchema, CreativePermissionSchema, TurnAnalysisSchema
     from backend.services.book_ingestion_service import book_ingestion_service
     from backend.services.context_assembler import context_assembler
 
@@ -744,7 +751,7 @@ def test_step7_context_aware_naming_intelligence_tests_a_to_j(monkeypatch):
 
             # Mock Pass 1 to return baseline TurnAnalysisSchema so we verify AgentOrchestrator's naming classification
             monkeypatch.setattr(
-                gemini_service,
+                llm_service,
                 "generate_structured",
                 lambda prompt, response_schema, **kw: TurnAnalysisSchema(
                     primary_intent="CREATIVE_GENERATION",

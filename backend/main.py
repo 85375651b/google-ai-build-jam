@@ -1,14 +1,17 @@
 """FastAPI application entrypoint exposing all REST and SSE endpoints for the Worldbuilding Agent."""
 
 from contextlib import asynccontextmanager
+import asyncio
+from uuid import UUID
 import json
 import logging
 from pathlib import Path
 import shutil
 from typing import Any, Dict, List, Optional
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from backend.config import PROJECT_ROOT, settings
@@ -51,26 +54,116 @@ from backend.services.bible_service import bible_service
 from backend.services.book_ingestion_service import book_ingestion_service
 from backend.services.consistency_service import consistency_service
 from backend.services.context_assembler import context_assembler
-from backend.services.gemini_service import GeminiServiceError, gemini_service
+from backend.services.llm_service import LocalModelError, llm_service
 from backend.services.world_service import world_service
+from backend.services.generation_service import generation_service
+from backend.services.entity_service import entity_service
+from backend.schemas import CanonBatchRequest, EntityOperation
+from backend.models import Entity, CanonOperationBatch, NamingPolicy, CanonSyncIssue
 
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    generation_service.recover_interrupted()
     db_gen = get_db()
     db = next(db_gen)
     try:
-        book_ingestion_service.ensure_primary_book_ingested(db, generate_embeddings=False)
+        book_ingestion_service.ensure_primary_book_ingested(db)
     except Exception as exc:
         logger.warning("Startup book check skipped: %s", exc)
     finally:
         db.close()
-    yield
+    try:
+        yield
+    finally:
+        await generation_service.shutdown()
 
 
 app = FastAPI(title="Worldbuilding Agent API", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(LocalModelError)
+async def local_operation_error(_request, error):
+    return JSONResponse(status_code=error.status_code, content={'detail': {'error_code': error.error_code, 'message':error.message}})
+
+
+@app.get('/api/worlds/{world_id}/entities')
+def list_entities(world_id: str, db: Session = Depends(get_db)):
+    return [entity_service.snapshot(db, entity) for entity in db.query(Entity).filter_by(world_id=world_id)]
+
+
+@app.get('/api/worlds/{world_id}/entities/{entity_id}')
+def get_entity(world_id: str, entity_id: str, db: Session = Depends(get_db)):
+    return entity_service.snapshot(db, entity_service.resolve(db, world_id, entity_id))
+
+
+@app.post('/api/worlds/{world_id}/entity-operations')
+def apply_entity_operations(world_id: str, payload: CanonBatchRequest, db: Session = Depends(get_db)):
+    try:
+        return entity_service.execute(db, world_id, payload.operations, payload.idempotency_key, manual=True)
+    except LocalModelError:
+        raise
+    except Exception:
+        raise HTTPException(500, 'The changes could not be saved. Existing World Bible entries are unchanged.')
+
+
+@app.get('/api/worlds/{world_id}/entity-operation-batches')
+def list_operation_batches(world_id: str, db: Session = Depends(get_db)):
+    return [{'id': batch.id, 'status': batch.status, 'result': json.loads(batch.result_json)}
+            for batch in db.query(CanonOperationBatch).filter_by(world_id=world_id)]
+
+
+@app.post('/api/worlds/{world_id}/entity-operation-batches/{batch_id}/approve')
+def approve_entity_batch(world_id: str, batch_id: str, payload: CanonBatchRequest, db: Session = Depends(get_db)):
+    batch = db.get(CanonOperationBatch, batch_id)
+    if batch is None or batch.world_id != world_id or batch.status not in {'proposed', 'approved'}:
+        raise HTTPException(409, 'This batch is not an unapproved proposal.')
+    if batch.status == 'approved':
+        return json.loads(batch.result_json)
+    stored = json.loads(batch.operations_json)
+    if len(stored) != len(payload.operations):
+        raise HTTPException(409, 'Approve the complete proposal batch.')
+    for old, new in zip(stored, payload.operations):
+        new_value = new.model_dump()
+        if old != new_value:
+            raise HTTPException(409, 'Proposal contents changed; submit an explicit author edit instead.')
+    operations = [op.model_copy(update={'decision_origin': 'AUTHOR', 'action': 'set_property' if op.action == 'propose' else op.action,
+                    'source_quote': f'Author approved batch {batch_id}'}) for op in payload.operations]
+    result = entity_service.execute(db, world_id, operations, payload.idempotency_key, manual='APPROVED', approval_batch_id=batch_id)
+    return result
+
+
+@app.get('/api/worlds/{world_id}/canon-sync-issues')
+def list_canon_sync_issues(world_id: str, db: Session = Depends(get_db)):
+    return [{'id': row.id, 'entity_id': row.entity_id, 'section_id': row.section_id, 'status': row.status, 'detail': row.detail}
+            for row in db.query(CanonSyncIssue).filter_by(world_id=world_id)]
+
+
+@app.put('/api/worlds/{world_id}/naming-policies/{entity_type}')
+def update_naming_policy(world_id: str, entity_type: str, payload: Dict[str, bool], db: Session = Depends(get_db)):
+    from backend.services.entity_service import TYPES
+    if entity_type not in TYPES or set(payload) - {'canonical_unique', 'aliases_unique'}:
+        raise HTTPException(422, 'Unsupported naming policy.')
+    try:
+        db.execute(text('BEGIN IMMEDIATE'))
+        if db.get(World, world_id) is None:
+            raise HTTPException(404, 'World not found.')
+        policy = db.query(NamingPolicy).filter_by(world_id=world_id, entity_type=entity_type).first()
+        if policy is None:
+            policy = NamingPolicy(world_id=world_id, entity_type=entity_type,
+                canonical_unique=entity_type not in {'character','family','species'}, aliases_unique=False)
+            db.add(policy)
+        for name, value in payload.items():
+            setattr(policy, name, value)
+        db.flush()
+        entities = {e.id: e for e in db.query(Entity).filter_by(world_id=world_id, entity_type=entity_type)}
+        entity_service.validate(db, world_id, entities)
+        db.commit()
+        return {'entity_type': entity_type, 'canonical_unique': policy.canonical_unique, 'aliases_unique': policy.aliases_unique}
+    except Exception:
+        db.rollback(); raise
 
 app.add_middleware(
     CORSMiddleware,
@@ -93,12 +186,11 @@ def get_system_status(db: Session = Depends(get_db)) -> Dict[str, Any]:
         db.query(ResearchSource).order_by(ResearchSource.retrieved_at.desc()).limit(50).all()
     )
     return {
-        "has_valid_gemini_key": settings.has_valid_gemini_key,
-        "has_valid_claude_key": settings.has_valid_claude_key,
+        "llm_provider": "ollama",
+        "local_model": settings.local_model,
+        "local_model_status": llm_service.get_status(),
         "has_valid_tavily_key": settings.has_valid_tavily_key,
-        "gemini_model": settings.gemini_model,
-        "claude_model": settings.claude_model,
-        "gemini_embedding_model": settings.gemini_embedding_model,
+        "retrieval_method": "fts5-bm25",
         "reference_documents": [
             {
                 "id": d.id,
@@ -131,12 +223,8 @@ def get_system_status(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 @app.put("/api/system/model")
 def update_model_config(payload: ModelConfigUpdateRequest) -> Dict[str, Any]:
-    settings.update_model(payload.gemini_model, payload.gemini_embedding_model)
-    return {
-        "claude_model": settings.claude_model,
-        "gemini_model": settings.gemini_model,
-        "gemini_embedding_model": settings.gemini_embedding_model,
-    }
+    settings.update_model(payload.local_model)
+    return {"local_model": settings.local_model, "llm_provider": "ollama"}
 
 
 @app.post("/api/sources/upload")
@@ -159,7 +247,6 @@ def upload_reference_book(
             file_path=dest_path,
             title=title or dest_path.stem,
             author=author or "Uploaded Reference",
-            generate_embeddings=False,
         )
         return {
             "id": doc.id,
@@ -176,13 +263,10 @@ def upload_reference_book(
 def generate_document_embeddings(
     doc_id: str, db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    if not settings.has_valid_gemini_key:
-        raise HTTPException(
-            status_code=401,
-            detail="GEMINI_API_KEY is not configured in .env. Please add your key first.",
-        )
-    count = book_ingestion_service.generate_missing_embeddings(db, doc_id, max_chunks=400)
-    return {"embedded_chunks": count}
+    raise HTTPException(
+        status_code=409,
+        detail="Book retrieval uses local SQLite full-text search; vector embeddings are not required.",
+    )
 
 
 # ============================================================================
@@ -832,271 +916,100 @@ def list_messages(
     return out
 
 
-@app.post("/api/conversations/{conversation_id}/messages")
-def send_message_sync(
-    conversation_id: str,
-    payload: ChatMessageRequest,
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
-    world = world_service.get_world(db, conv.world_id)
-    if not world:
-        raise HTTPException(status_code=404, detail="World not found.")
 
+class GenerationResponse(StreamingResponse):
+    """Framework disconnects cancel the owned operation, not just the SSE reader."""
+    def __init__(self, content, control=None):
+        super().__init__(content, media_type="text/event-stream", headers={
+            "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no",
+        })
+        self.control = control
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if self.control is not None and not self.control.done.is_set():
+                await asyncio.to_thread(self.control.cancel, "Browser connection closed.")
+
+
+def _sse(event):
+    return "data: " + json.dumps(event) + "\n\n"
+
+
+async def _generation_events(control):
+    pending = asyncio.create_task(control.events.get())
+    finished = asyncio.create_task(control.done.wait())
     try:
-        # 1. Pass 1: Analyze turn
-        analysis = agent_orchestrator.analyze_turn(db, world, payload.content)
-        # 2. Retrieve book & online research
-        knowledge = agent_orchestrator.retrieve_knowledge(db, analysis)
-        # 3. Assemble 8-layer context
-        sys_prompt = context_assembler.assemble_consultant_system_prompt(
-            db=db,
-            world=world,
-            turn_analysis=analysis,
-            book_retrieval=knowledge["book"],
-            online_research=knowledge["online"],
-            focused_subject_id=payload.focused_subject_id or conv.focused_subject_id,
-            conversation=conv,
-        )
-        contents = context_assembler.build_conversation_contents(
-            db, conv, payload.content
-        )
-        # 4. Generate consultant response
-        raw_reply = gemini_service.generate_text(
-            contents=contents,
-            system_instruction=sys_prompt,
-            temperature=0.4,
-        )
-        sanitized = agent_orchestrator.sanitize_response_and_verify_citations(
-            raw_reply, knowledge["book"], knowledge["online"]
-        )
+        while True:
+            ready, _ = await asyncio.wait({pending, finished},
+                                          timeout=settings.generation_heartbeat_seconds,
+                                          return_when=asyncio.FIRST_COMPLETED)
+            if pending in ready:
+                yield _sse(pending.result())
+                pending = asyncio.create_task(control.events.get())
+            elif finished in ready:
+                # A queued event may have been picked up in the same loop tick.
+                if pending.done():
+                    yield _sse(pending.result())
+                while not control.events.empty():
+                    yield _sse(control.events.get_nowait())
+                yield _sse(control.terminal)
+                return
+            else:
+                yield _sse(dict(type="heartbeat", request_id=control.request_id,
+                                conversation_id=control.conversation_id, world_id=control.world_id,
+                                stage=control.state))
+    finally:
+        pending.cancel()
+        finished.cancel()
+        await asyncio.gather(pending, finished, return_exceptions=True)
 
-        # 5. Persist messages ONLY after successful generation
-        user_msg = Message(
-            conversation_id=conv.id,
-            role="USER",
-            content=payload.content.strip(),
-            interaction_mode=analysis.primary_intent,
-            permission_level=analysis.creative_permission.level,
-        )
-        db.add(user_msg)
-        db.flush()
 
-        meta_dict = {
-            "primary_intent": analysis.primary_intent,
-            "secondary_intents": analysis.secondary_intents,
-            "permission_level": analysis.creative_permission.level,
-            "naming_mode": analysis.creative_permission.naming_mode,
-            "active_domains": analysis.active_domains,
-            "book_coverage": knowledge["book"]["coverage_status"],
-            "online_research_status": knowledge["online"]["status"],
-            "citations": sanitized["citations"],
-        }
-        assistant_msg = Message(
-            conversation_id=conv.id,
-            role="ASSISTANT",
-            content=sanitized["content"],
-            interaction_mode=analysis.primary_intent,
-            permission_level=analysis.creative_permission.level,
-            metadata_json=json.dumps(meta_dict),
-        )
-        db.add(assistant_msg)
-        db.commit()
-        db.refresh(assistant_msg)
-
-        # 6. Pass 3: World Bible Editing & Canon Extraction
-        post_turn = agent_orchestrator.extract_post_turn_proposals(
-            db, world, conv, user_msg, assistant_msg, analysis
-        )
-        proposals = post_turn["staged_proposals"]
-        updated_sections = post_turn["updated_sections"]
-        contradictions = post_turn.get("detected_contradictions", [])
-
-        if updated_sections or contradictions:
-            if updated_sections:
-                meta_dict["updated_bible_sections"] = updated_sections
-            if contradictions:
-                meta_dict["detected_contradictions"] = contradictions
-            assistant_msg.metadata_json = json.dumps(meta_dict)
-            db.commit()
-
-        return {
-            "user_message_id": user_msg.id,
-            "assistant_message": {
-                "id": assistant_msg.id,
-                "role": "ASSISTANT",
-                "content": assistant_msg.content,
-                "interaction_mode": assistant_msg.interaction_mode,
-                "permission_level": assistant_msg.permission_level,
-                "metadata": meta_dict,
-                "created_at": assistant_msg.created_at.isoformat(),
-            },
-            "updated_bible_sections": updated_sections,
-            "detected_contradictions": contradictions,
-            "staged_proposals": [
-                {
-                    "id": p.id,
-                    "proposed_title": p.proposed_title,
-                    "proposed_content": p.proposed_content,
-                    "proposed_provenance": p.proposed_provenance,
-                }
-                for p in proposals
-            ],
-        }
-    except GeminiServiceError as exc:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail={"error_code": exc.error_code, "message": exc.message},
-        ) from exc
+async def _replay_event(event):
+    yield _sse(event)
 
 
 @app.post("/api/conversations/{conversation_id}/stream")
-def stream_message(
-    conversation_id: str,
-    payload: ChatMessageRequest,
-    db: Session = Depends(get_db),
-) -> StreamingResponse:
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found.")
-    world = world_service.get_world(db, conv.world_id)
-    if not world:
-        raise HTTPException(status_code=404, detail="World not found.")
+async def stream_message(conversation_id: str, payload: ChatMessageRequest) -> StreamingResponse:
+    request_id, world_id, terminal = await asyncio.to_thread(generation_service.reserve, conversation_id, payload)
+    if terminal is not None:
+        return GenerationResponse(_replay_event(terminal))
+    control = generation_service.launch(request_id, conversation_id, world_id, payload)
+    return GenerationResponse(_generation_events(control), control)
 
-    settings.reload()
-    if not settings.has_any_valid_llm_key:
-        raise HTTPException(
-            status_code=401,
-            detail={
-                "error_code": "MISSING_API_KEY",
-                "message": "Neither GEMINI_API_KEY nor CLAUDE_API_KEY is configured in .env. Please paste your API key into .env.",
-            },
-        )
 
-    def event_generator():
+@app.post("/api/conversations/{conversation_id}/messages")
+async def send_message_sync(conversation_id: str, payload: ChatMessageRequest, request: Request) -> Dict[str, Any]:
+    request_id, world_id, terminal = await asyncio.to_thread(generation_service.reserve, conversation_id, payload)
+    if terminal is None:
+        control = generation_service.launch(request_id, conversation_id, world_id, payload, streaming=False)
         try:
-            analysis = agent_orchestrator.analyze_turn(db, world, payload.content)
-            knowledge = agent_orchestrator.retrieve_knowledge(db, analysis)
-            yield "data: " + json.dumps(
-                {
-                    "type": "turn_meta",
-                    "primary_intent": analysis.primary_intent,
-                    "permission_level": analysis.creative_permission.level,
-                    "naming_mode": analysis.creative_permission.naming_mode,
-                    "active_domains": analysis.active_domains,
-                    "book_coverage": knowledge["book"]["coverage_status"],
-                }
-            ) + "\n\n"
+            while not control.done.is_set():
+                if await request.is_disconnected():
+                    await asyncio.to_thread(control.cancel, "Browser connection closed.")
+                await asyncio.wait({control.task}, timeout=0.25)
+            terminal = control.terminal
+        except asyncio.CancelledError:
+            await asyncio.to_thread(control.cancel, "Browser connection closed.")
+            raise
+    if terminal["type"] != "complete":
+        raise HTTPException(409 if terminal["type"] == "cancelled" else 502, detail=terminal)
+    return terminal
 
-            sys_prompt = context_assembler.assemble_consultant_system_prompt(
-                db=db,
-                world=world,
-                turn_analysis=analysis,
-                book_retrieval=knowledge["book"],
-                online_research=knowledge["online"],
-                focused_subject_id=payload.focused_subject_id or conv.focused_subject_id,
-                conversation=conv,
-            )
-            contents = context_assembler.build_conversation_contents(
-                db, conv, payload.content
-            )
 
-            accumulated: List[str] = []
-            for chunk_str in gemini_service.stream_text(
-                contents=contents,
-                system_instruction=sys_prompt,
-                temperature=0.4,
-            ):
-                accumulated.append(chunk_str)
-                yield "data: " + json.dumps({"type": "delta", "text": chunk_str}) + "\n\n"
+@app.post("/api/conversations/{conversation_id}/requests/{request_id}/cancel")
+async def cancel_generation(conversation_id: str, request_id: UUID):
+    control = await asyncio.to_thread(generation_service.cancel, conversation_id, str(request_id))
+    if control is not None:
+        try:
+            await asyncio.wait_for(control.done.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            # Cancellation has been requested; completion is still observable via SSE/status.
+            pass
+    return await asyncio.to_thread(generation_service.status, conversation_id, str(request_id))
 
-            full_raw = "".join(accumulated)
-            sanitized = agent_orchestrator.sanitize_response_and_verify_citations(
-                full_raw, knowledge["book"], knowledge["online"]
-            )
 
-            user_msg = Message(
-                conversation_id=conv.id,
-                role="USER",
-                content=payload.content.strip(),
-                interaction_mode=analysis.primary_intent,
-                permission_level=analysis.creative_permission.level,
-            )
-            db.add(user_msg)
-            db.flush()
-
-            meta_dict = {
-                "primary_intent": analysis.primary_intent,
-                "secondary_intents": analysis.secondary_intents,
-                "permission_level": analysis.creative_permission.level,
-                "naming_mode": analysis.creative_permission.naming_mode,
-                "active_domains": analysis.active_domains,
-                "book_coverage": knowledge["book"]["coverage_status"],
-                "online_research_status": knowledge["online"]["status"],
-                "citations": sanitized["citations"],
-            }
-            assistant_msg = Message(
-                conversation_id=conv.id,
-                role="ASSISTANT",
-                content=sanitized["content"],
-                interaction_mode=analysis.primary_intent,
-                permission_level=analysis.creative_permission.level,
-                metadata_json=json.dumps(meta_dict),
-            )
-            db.add(assistant_msg)
-            db.commit()
-            db.refresh(assistant_msg)
-
-            post_turn = agent_orchestrator.extract_post_turn_proposals(
-                db, world, conv, user_msg, assistant_msg, analysis
-            )
-            proposals = post_turn["staged_proposals"]
-            updated_sections = post_turn["updated_sections"]
-            contradictions = post_turn.get("detected_contradictions", [])
-
-            if updated_sections or contradictions:
-                if updated_sections:
-                    meta_dict["updated_bible_sections"] = updated_sections
-                if contradictions:
-                    meta_dict["detected_contradictions"] = contradictions
-                assistant_msg.metadata_json = json.dumps(meta_dict)
-                db.commit()
-
-            yield "data: " + json.dumps(
-                {
-                    "type": "complete",
-                    "user_message_id": user_msg.id,
-                    "assistant_message": {
-                        "id": assistant_msg.id,
-                        "role": "ASSISTANT",
-                        "content": assistant_msg.content,
-                        "interaction_mode": assistant_msg.interaction_mode,
-                        "permission_level": assistant_msg.permission_level,
-                        "metadata": meta_dict,
-                        "created_at": assistant_msg.created_at.isoformat(),
-                    },
-                    "updated_bible_sections": updated_sections,
-                    "detected_contradictions": contradictions,
-                    "staged_proposals": [
-                        {
-                            "id": p.id,
-                            "proposed_title": p.proposed_title,
-                            "proposed_content": p.proposed_content,
-                            "proposed_provenance": p.proposed_provenance,
-                        }
-                        for p in proposals
-                    ],
-                }
-            ) + "\n\n"
-        except GeminiServiceError as exc:
-            yield "data: " + json.dumps(
-                {"type": "error", "error_code": exc.error_code, "message": exc.message}
-            ) + "\n\n"
-        except Exception as exc:
-            yield "data: " + json.dumps(
-                {"type": "error", "error_code": "SERVER_ERROR", "message": str(exc)}
-            ) + "\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+@app.get("/api/conversations/{conversation_id}/requests/{request_id}")
+def get_generation_status(conversation_id: str, request_id: UUID):
+    return generation_service.status(conversation_id, str(request_id))

@@ -125,6 +125,12 @@ class BibleService:
         implements Decision 3(b): returns any linked facts whose prose was deleted
         so the author can confirm whether to retire or keep them active.
         """
+        from sqlalchemy import update
+        expected = payload.expected_version_number if payload.expected_version_number is not None else section.version_number
+        checked = db.execute(update(BibleSection).where(BibleSection.id == section.id,
+            BibleSection.version_number == expected).values(version_number=expected).execution_options(synchronize_session=False))
+        if checked.rowcount != 1:
+            raise ValueError('Version conflict: reload the author-edited section before saving.')
         if (
             payload.expected_version_number is not None
             and payload.expected_version_number != section.version_number
@@ -158,6 +164,9 @@ class BibleService:
 
             orphaned_facts = self._sync_direct_markdown_to_facts(db, section)
 
+        if payload.markdown_content is not None and payload.markdown_content != prev_md:
+            from backend.services.entity_service import entity_service
+            entity_service.sync_manual_section(db, section, prev_md)
         db.commit()
         db.refresh(section)
         return section, orphaned_facts
@@ -390,6 +399,7 @@ class BibleService:
         updated_markdown: str,
         summary_of_changes: str = "Updated by Agent from Author Brain Dump / Instructions",
         provenance: str = "AUTHOR_CREATED",
+        expected_version_number: Optional[int] = None,
     ) -> Optional[BibleSection]:
         """Apply a structured World Bible section update, fitting into default categories first."""
         clean_slug = slugify(section_slug or section_title)
@@ -469,6 +479,17 @@ class BibleService:
         else:
             prev_md = section.markdown_content or ""
             new_md = updated_markdown.strip()
+            from sqlalchemy import update
+            expected = expected_version_number if expected_version_number is not None else section.version_number
+            checked = db.execute(update(BibleSection).where(BibleSection.id == section.id,
+                BibleSection.version_number == expected).values(version_number=expected).execution_options(synchronize_session=False))
+            if checked.rowcount != 1:
+                raise ValueError('The section changed before the agent update could be applied.')
+            from backend.models import EntityProperty
+            for fact in db.query(Fact).join(EntityProperty, EntityProperty.fact_id == Fact.id).join(BibleSectionFact,
+                    BibleSectionFact.fact_id == Fact.id).filter(BibleSectionFact.section_id == section.id):
+                if fact.content in prev_md and fact.content not in new_md:
+                    raise ValueError('A tracked entity property must be changed through a structured operation.')
             if new_md and new_md != prev_md.strip():
                 section.markdown_content = new_md
                 section.version_number += 1
@@ -491,6 +512,7 @@ class BibleService:
                     )
                 )
 
+        self._sync_direct_markdown_to_facts(db, section)
         db.commit()
         db.refresh(section)
         return section
@@ -521,6 +543,10 @@ class BibleService:
         source_message_id: Optional[str] = None,
         sync_to_bible_section: bool = True,
     ) -> Fact:
+        existing = db.query(Fact).filter_by(world_id=world_id, content=payload.content.strip(),
+            canon_status=payload.canon_status, provenance_type=payload.provenance_type).first()
+        if existing:
+            return existing
         tier = 1 if payload.provenance_type == "AUTHOR_CREATED" else 2
         fact = Fact(
             world_id=world_id,
@@ -711,6 +737,24 @@ class BibleService:
             status="PENDING",
         )
         db.add(proposal)
+        db.flush()
+        # Keep existing proposal buttons, but snapshot structured targets now so
+        # approving a stale naming suggestion cannot overwrite a later author edit.
+        from backend.services.canon_language import compile_decisions
+        from backend.schemas import AuthorDecisionSchema
+        from backend.services.entity_service import entity_service, dump
+        from backend.models import CanonOperationBatch
+        import hashlib
+        operations = compile_decisions([AuthorDecisionSchema(kind='DECLARATION', source_quote=proposal.proposed_content)], proposal.proposed_content)
+        if operations:
+            for operation in operations:
+                entity = entity_service.resolve(db, world_id, ref=operation.entity_ref, required=False)
+                operation.expected_version = entity.version_number if entity else None
+                operation.entity_id = entity.id if entity else None
+            encoded = dump([operation.model_dump() for operation in operations])
+            db.add(CanonOperationBatch(world_id=world_id, idempotency_key=f'legacy-proposal:{proposal.id}',
+                fingerprint=hashlib.sha256(encoded.encode()).hexdigest(), status='proposed', operations_json=encoded,
+                result_json=dump({'status':'proposed', 'message':'Not yet canon.'})))
         db.commit()
         db.refresh(proposal)
         return proposal
@@ -723,6 +767,10 @@ class BibleService:
     ) -> Dict[str, Any]:
         """Approve, edit-and-approve, or reject a staged canon proposal."""
         action = payload.action.upper()
+        if proposal.status in {'APPROVED', 'EDITED_AND_APPROVED'}:
+            return {'proposal_status': proposal.status, 'fact_id': proposal.target_fact_id}
+        if proposal.status == 'REJECTED' and action != 'REJECT':
+            raise ValueError('A rejected suggestion requires a new explicit author decision.')
         now = datetime.now(timezone.utc)
 
         final_title = (payload.edited_title or proposal.proposed_title).strip()
@@ -747,6 +795,36 @@ class BibleService:
 
         if action not in {"APPROVE", "EDIT_AND_APPROVE"}:
             raise ValueError(f"Unsupported proposal action: {action}")
+
+        from backend.models import FactRelationship
+        unresolved = db.query(FactRelationship).join(Fact, Fact.id == FactRelationship.source_fact_id).filter(
+            Fact.source_message_id == proposal.source_message_id, Fact.world_id == proposal.world_id,
+            FactRelationship.relationship_type == 'CONTRADICTS', FactRelationship.is_resolved == False).first()
+        if proposal.source_message_id and unresolved:
+            raise ValueError('Clarify or resolve the recorded contradiction before approving this proposal.')
+
+        from backend.models import CanonOperationBatch, EntityProperty
+        from backend.schemas import EntityOperation
+        from backend.services.entity_service import entity_service
+        structured = db.query(CanonOperationBatch).filter_by(world_id=proposal.world_id,
+            idempotency_key=f'legacy-proposal:{proposal.id}').first()
+        if structured and action == 'APPROVE':
+            from sqlalchemy import update
+            db.execute(update(World).where(World.id == proposal.world_id).values(name=World.name))
+            import json
+            operations = [EntityOperation.model_validate(item).model_copy(update={
+                'source_quote': f'Author approved proposal {proposal.id}', 'decision_origin':'AUTHOR'})
+                for item in json.loads(structured.operations_json)]
+            result = entity_service.apply(db, proposal.world_id, operations, f'approved-proposal:{proposal.id}', manual='APPROVED')
+            entity_id = result['entities'][0] if result['entities'] else None
+            prop = db.query(EntityProperty).filter_by(entity_id=entity_id, property_key='canonical_name').first()
+            proposal.status, proposal.resolved_at = 'APPROVED', now
+            proposal.target_fact_id = prop.fact_id if prop else None
+            structured.status = 'approved'; structured.result_json = json.dumps(result)
+            db.commit()
+            return {'proposal_status':'APPROVED', 'fact_id':proposal.target_fact_id, 'canon_result':result}
+        if structured and action == 'EDIT_AND_APPROVE':
+            raise ValueError('Edit the structured property explicitly so its current version can be confirmed.')
 
         # Determine provenance: if author edited the text or originally created it, mark accordingly
         provenance = proposal.proposed_provenance

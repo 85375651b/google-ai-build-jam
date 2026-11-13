@@ -54,8 +54,13 @@ SessionLocal = sessionmaker(
 def init_db() -> None:
     """Initialize all relational tables and SQLite FTS5 virtual tables."""
     import backend.models  # noqa: F401 - ensure models are registered
-
+    # Back up legacy data before any new DDL. Empty databases need base tables first.
+    from sqlalchemy import inspect
+    from backend.migrations import migrate
+    if 'worlds' in inspect(engine).get_table_names():
+        migrate(engine)
     Base.metadata.create_all(bind=engine)
+    migrate(engine)
 
     with engine.begin() as conn:
         # FTS5 index for reference book chunks (BM25 keyword retrieval)

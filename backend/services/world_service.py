@@ -449,6 +449,7 @@ class WorldService:
                     "authority_tier": f.authority_tier,
                     "consistency_status": f.consistency_status,
                     "consistency_notes": f.consistency_notes,
+                    "source_message_id": f.source_message_id,
                     "version_number": f.version_number,
                     "subject_slugs": f_slugs,
                 }
@@ -470,6 +471,7 @@ class WorldService:
                     "is_archived": conv.is_archived,
                     "messages": [
                         {
+                            "id": m.id,
                             "role": m.role,
                             "content": m.content,
                             "interaction_mode": m.interaction_mode,
@@ -481,7 +483,9 @@ class WorldService:
                 }
             )
 
+        from backend.services.canon_archive import export_canon
         return {
+            "structured_canon": export_canon(db, world.id),
             "schema_version": "1.0",
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "world": {
@@ -494,6 +498,7 @@ class WorldService:
             },
             "subjects": [
                 {
+                    "id": s.id,
                     "name": s.name,
                     "slug": s.slug,
                     "description": s.description or "",
@@ -549,6 +554,13 @@ class WorldService:
         }
 
     def import_project_bundle(self, db: Session, bundle: Dict[str, Any]) -> World:
+        try:
+            return self._import_project_bundle(db, bundle)
+        except Exception:
+            db.rollback()
+            raise
+
+    def _import_project_bundle(self, db: Session, bundle: Dict[str, Any]) -> World:
         """Restore a complete world project from an exported JSON bundle without primary-key collisions."""
         world_data = bundle.get("world")
         if not isinstance(world_data, dict) or not (world_data.get("name") or "").strip():
@@ -591,6 +603,7 @@ class WorldService:
                 )
             )
 
+        identity_mapping = {}
         # 2. Restore subjects
         slug_to_subj_id: Dict[str, str] = {}
         raw_subjects = bundle.get("subjects") or DEFAULT_WORLD_SUBJECTS
@@ -610,6 +623,8 @@ class WorldService:
             db.add(subj)
             db.flush()
             slug_to_subj_id[s_slug] = subj.id
+            if s_item.get("id"):
+                identity_mapping[s_item["id"]] = subj.id
 
         # 3. Restore Bible sections & revision history
         raw_sections = bundle.get("bible_sections", [])
@@ -631,6 +646,8 @@ class WorldService:
             db.add(sec)
             db.flush()
 
+            if sec_item.get("id"):
+                identity_mapping[sec_item["id"]] = sec.id
             for rev_item in sec_item.get("revisions", []):
                 db.add(
                     BibleSectionRevision(
@@ -688,6 +705,7 @@ class WorldService:
             )
             consistency_service.sync_fact_fts(db, new_f)
 
+        identity_mapping.update(old_fact_id_to_new)
         # 5. Restore cross-domain fact relationships
         for rel_item in bundle.get("fact_relationships", []):
             src_id = old_fact_id_to_new.get(rel_item.get("source_fact_id", ""))
@@ -720,16 +738,12 @@ class WorldService:
                 db.add(conv)
                 db.flush()
                 for m_item in c_item.get("messages", []):
-                    db.add(
-                        Message(
-                            conversation_id=conv.id,
-                            role=m_item.get("role", "USER"),
-                            content=m_item.get("content") or "",
-                            interaction_mode=m_item.get("interaction_mode", "GENERAL"),
-                            permission_level=m_item.get("permission_level", "FACTUAL_ONLY"),
-                            metadata_json=m_item.get("metadata_json") or "{}",
-                        )
-                    )
+                    message = Message(conversation_id=conv.id, role=m_item.get("role", "USER"),
+                        content=m_item.get("content") or "", interaction_mode=m_item.get("interaction_mode", "GENERAL"),
+                        permission_level=m_item.get("permission_level", "FACTUAL_ONLY"), metadata_json=m_item.get("metadata_json") or "{}")
+                    db.add(message); db.flush()
+                    if m_item.get("id"):
+                        identity_mapping[m_item["id"]] = message.id
 
         # 7. Restore proposals & unresolved questions
         for prop_item in bundle.get("proposals", []):
@@ -753,6 +767,12 @@ class WorldService:
                 )
             )
 
+        from backend.services.canon_archive import import_canon
+        for item in bundle.get('facts', []):
+            restored_id = old_fact_id_to_new.get(item.get('id'))
+            if restored_id and item.get('source_message_id') in identity_mapping:
+                db.get(Fact, restored_id).source_message_id = identity_mapping[item['source_message_id']]
+        import_canon(db, world, bundle.get('structured_canon'), identity_mapping)
         db.commit()
         db.refresh(world)
         return world

@@ -1,12 +1,13 @@
-"""Pydantic schemas for API requests, responses, and structured Gemini outputs."""
+"""Pydantic schemas for API requests, responses, and structured Local Model outputs."""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 from pydantic import BaseModel, Field
 
 
 # ============================================================================
-# Structured Gemini Output Schemas (Step 2 Pass 1 & Pass 3)
+# Structured Local Model Output Schemas (Step 2 Pass 1 & Pass 3)
 # ============================================================================
 
 class ExpertiseSignalSchema(BaseModel):
@@ -31,6 +32,8 @@ class ExpertiseSignalSchema(BaseModel):
 
 
 class CreativePermissionSchema(BaseModel):
+    authorization_kind: Literal["NONE", "SUGGEST", "DELEGATE", "DRAFT"] = "NONE"
+    resolved_target: str = Field(default="", description="Exact entity/task phrase from the author or reference context; for naming, entity only (Planet X, not Planet X's name); empty if unresolved")
     level: str = Field(
         description="FACTUAL_ONLY | ANALYTICAL_ADVISORY | IMPLEMENTATION_SCOPED | BOUNDED_BRAINSTORMING | EXPLICIT_DRAFTING"
     )
@@ -60,7 +63,17 @@ class CreativePermissionSchema(BaseModel):
     )
 
 
+class AuthorDecisionSchema(BaseModel):
+    kind: Literal["DECLARATION", "CORRECTION", "PROHIBITION"]
+    source_quote: str = Field(description="Exact complete author clause establishing this decision; never assistant text")
+    requires_clarification: bool = Field(default=False, description="True if applying this clause would require guessing a referent, value, or intent")
+    record_in_bible: bool = Field(default=True, description="False for procedural controls on the assistant, rather than facts about the fictional world")
+
+
 class TurnAnalysisSchema(BaseModel):
+    author_decisions: List[AuthorDecisionSchema] = Field(default_factory=list)
+    uncertain_statements: List[str] = Field(default_factory=list, description="Exact author clauses that are hypothetical, undecided, or ambiguous; do not establish these as canon")
+    clarification_question: str = ""
     primary_intent: str = Field(
         description="QUESTION_EXPLANATION | FACTUAL_RESEARCH | IMPLEMENTATION_ASSISTANCE | CREATIVE_GENERATION | EVALUATION_CRITICISM | WORLD_BIBLE_MANAGEMENT | CANON_DECLARATION | HYPOTHETICAL_EXPLORATION | SUGGESTION_DISPOSITION"
     )
@@ -91,6 +104,9 @@ class TurnAnalysisSchema(BaseModel):
 
 
 class CandidateProposalItem(BaseModel):
+    source_quote: str = Field(default="", description="Exact author-decision clause or explicit delegation authorizing this item")
+    decision_origin: Literal["AUTHOR", "DELEGATED", "SUGGESTION"] = "AUTHOR"
+    decision_target: str = Field(default="", description="For delegated decisions, exact entity or task target named in the authorization/context")
     proposal_type: str = Field(
         default="NEW_FACT",
         description="NEW_FACT | UPDATE_FACT | BIBLE_SECTION_PATCH | OPEN_QUESTION",
@@ -118,6 +134,7 @@ class CandidateProposalItem(BaseModel):
 
 
 class BibleSectionEditItem(BaseModel):
+    source_quote: str = Field(default="", description="Exact clear author-decision clause supporting the change; suggestions cannot rewrite canon")
     section_slug: str = Field(
         description="Target section slug (e.g., cosmology-physics, geography-geology, climate-ecology, biology-evolution, history-chronology, languages-linguistics, cultures-societies, religion-mythology, politics-governance, economics-trade, technology-engineering, warfare-military, philosophy-ideologies, demographics-population, architecture-material-culture, or a custom slug)"
     )
@@ -125,7 +142,7 @@ class BibleSectionEditItem(BaseModel):
         description="Human-readable title of the World Bible section"
     )
     updated_markdown: str = Field(
-        description="Complete, well-organized Markdown content for this section incorporating the newly extracted details alongside any existing content for this section. Use clean Markdown headings/bullet points/prose without inventing facts not stated or approved by the author."
+        description="Complete updated Markdown for the supplied section edit window, preserving its unchanged facts. For APPEND_ONLY return only new approved text. The backend preserves all omitted section content; never reconstruct it. Use clean Markdown without inventing facts not stated or approved by the author."
     )
     summary_of_changes: str = Field(
         default="Organized author worldbuilding details into section",
@@ -138,6 +155,7 @@ class BibleSectionEditItem(BaseModel):
 
 
 class RejectedIdeaItem(BaseModel):
+    source_quote: str = ""
     title: str
     content: str
     reason: str = ""
@@ -155,7 +173,37 @@ class DetectedContradictionItem(BaseModel):
     description: str = Field(description="Neutral description of the internal inconsistency")
 
 
+class EntityOperation(BaseModel):
+    action: Literal['create_entity', 'set_property', 'rename', 'clear_property', 'add_alias',
+        'remove_alias', 'reserve_name', 'release_name', 'reject_name', 'add_relationship', 'remove_relationship',
+        'add_constraint', 'remove_constraint', 'mark_superseded', 'propose']
+    entity_id: Optional[str] = None
+    entity_ref: str = ''
+    entity_type: Literal['', 'planet', 'star', 'moon', 'country', 'city', 'character', 'family',
+        'organization', 'religion', 'language', 'event', 'species', 'institution', 'cultural_group'] = ''
+    scope_key: Optional[str] = None
+    expected_version: Optional[int] = None
+    property_key: str = ''
+    value: Any = None
+    related_entity_id: Optional[str] = None
+    related_entity_ref: str = ''
+    related_expected_version: Optional[int] = None
+    relationship_type: str = ''
+    constraint_type: str = ''
+    source_quote: str = ''
+    decision_origin: Literal['AUTHOR', 'DELEGATED', 'SUGGESTION', 'HYPOTHETICAL', 'RESEARCH'] = 'AUTHOR'
+    decision_target: str = ''
+    section_slug: str = ''
+
+
+class CanonBatchRequest(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=160)
+    operations: List[EntityOperation] = Field(min_length=1, max_length=100)
+
+
 class PostTurnExtractionSchema(BaseModel):
+    operations: List[EntityOperation] = Field(default_factory=list, max_length=100,
+        description='Prefer explicit entity/property/name/relationship operations with stable IDs and exact author evidence over prose replacement. Existing entity versions must match supplied context.')
     bible_section_updates: List[BibleSectionEditItem] = Field(
         default_factory=list,
         description="Direct World Bible section edits/organizations extracted from the author's brain dump, stated world facts, or explicit World Bible editing instructions.",
@@ -290,10 +338,10 @@ class ConversationUpdate(BaseModel):
 
 
 class ChatMessageRequest(BaseModel):
+    request_id: Optional[UUID] = None
     content: str = Field(..., min_length=1)
     focused_subject_id: Optional[str] = None
 
 
 class ModelConfigUpdateRequest(BaseModel):
-    gemini_model: str
-    gemini_embedding_model: Optional[str] = None
+    local_model: str = Field(..., min_length=1, max_length=200, pattern=r"^\S+$")
